@@ -1,8 +1,15 @@
 import sys
 import random
 import math
+import os
+from pathlib import Path
+import datetime as dt
+from typing import Optional
 import pygame as pg
 from enum import Enum, auto
+
+import api_client
+from audio import AudioManager
 
 # === 基本設定 ===
 WIDTH, HEIGHT = 1280, 720
@@ -54,6 +61,10 @@ def draw_text(surface, text, font, color, pos, center=False):
 class Game:
     def __init__(self):
         pg.init()
+        try:
+            pg.mixer.init()
+        except Exception as e:
+            print("Audio init failed:", e)
         global WIDTH, HEIGHT
         # 視窗模式（保留標題列），允許調整大小
         self.screen = pg.display.set_mode((WIDTH, HEIGHT), pg.RESIZABLE)
@@ -65,6 +76,10 @@ class Game:
         self.font_large = pg.font.SysFont("arial", 40)
         self.font_medium = pg.font.SysFont("arial", 28)
         self.font_small = pg.font.SysFont("arial", 22)
+
+        # 路徑 / 音效
+        self.base_dir = Path(__file__).resolve().parent
+        self.audio = AudioManager(str(self.base_dir))
 
         # 狀態相關
         self.state = GameState.HOME
@@ -80,15 +95,24 @@ class Game:
         self.condition_code = None       # 1~4
         self.current_round = 0
         self.total_rounds = TOTAL_ROUNDS
+        self.exp_start_iso: Optional[str] = None
+        self.exp_logged = False
 
         # 回合內的統計
         self.round_score = 0
         self.round_errors = 0
+        self.round_collisions = 0
+        self.round_ball_spawn = 0
+        self.round_signal_sent = 0
+        self.round_ball_catch = 0
+        self.round_ball_miss = 0
         self.total_score = 0
         self.total_errors = 0
 
         # 計時與暫停
         self.round_start_ms = None
+        self.round_start_iso: Optional[str] = None
+        self.round_end_iso: Optional[str] = None
         self.round_paused = False
         self.round_pause_start_ms = None
         self.round_total_paused_ms = 0
@@ -112,13 +136,20 @@ class Game:
         self.human_x = WIDTH // 2 - PADDLE_W // 2
         self.human_y = int(HEIGHT * 0.82)
 
-        # self.agent_x = WIDTH // 2 - PADDLE_W // 2
-        # self.agent_y = int(HEIGHT * 0.72)
+        self.agent_x = WIDTH // 2 - PADDLE_W // 2
+        self.agent_y = int(HEIGHT * 0.75)
+        self.hit_cooldown_ms = 0  # 防止同一接觸重複計分
 
     def reset_round_stats(self):
         self.round_score = 0
         self.round_errors = 0
+        self.round_collisions = 0
+        self.round_ball_spawn = 0
+        self.round_signal_sent = 0
+        self.round_ball_catch = 0
+        self.round_ball_miss = 0
         self.round_start_ms = pg.time.get_ticks()
+        self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
         self.round_total_paused_ms = 0
         self.round_paused = False
         self.round_pause_start_ms = None
@@ -229,8 +260,10 @@ class Game:
         # 重置總成績
         self.total_score = 0
         self.total_errors = 0
+        self.start_experiment_api()
         # 進入第一回合
         self.reset_round_stats()
+        self.start_round_api()
         self.state = GameState.ROUND
         print(
             f"Start experiment: user_id={self.current_user_id}, "
@@ -247,6 +280,8 @@ class Game:
         self.ball_vx = speed_x if random.choice([True, False]) else -speed_x
         self.ball_vy = speed_y
         self.clamp_ball_speed()
+        self.round_ball_spawn += 1
+        self.log_event("ball_spawn", triggered_by="system")
 
     def clamp_ball_speed(self):
         """避免速度過低或過高，控制在合理範圍。"""
@@ -259,7 +294,7 @@ class Game:
         if 0 < abs(self.ball_vy) < min_speed:
             self.ball_vy = min_speed if self.ball_vy >= 0 else -min_speed
 
-    def rotate_velocity(self, deg_min: float = 20, deg_max: float = 35) -> None:
+    def rotate_velocity(self, deg_min: float = 30, deg_max: float = 50) -> None:
         """將速度向量旋轉一個隨機角度（deg_min~deg_max），增加角度變化。"""
         angle_deg = random.uniform(deg_min, deg_max)
         angle_deg *= 1 if random.choice([True, False]) else -1
@@ -269,6 +304,111 @@ class Game:
         vx, vy = self.ball_vx, self.ball_vy
         self.ball_vx = vx * cos_a - vy * sin_a
         self.ball_vy = vx * sin_a + vy * cos_a
+
+    # --- API / LOGGING ---
+    def _agent_human_flags(self) -> tuple[bool, bool]:
+        if self.condition_code == 1:
+            return False, False
+        if self.condition_code == 2:
+            return False, True
+        if self.condition_code == 3:
+            return True, False
+        if self.condition_code == 4:
+            return True, True
+        return False, False
+
+    def log_event(
+        self,
+        event_type: str,
+        triggered_by: str = "system",
+        signal_type: str = "NA",
+        dir_ratio: Optional[float] = None,
+    ) -> None:
+        if self.current_user_id is None or self.condition_code is None or self.current_round is None:
+            return
+        speed = math.sqrt(self.ball_vx ** 2 + self.ball_vy ** 2)
+        angle = math.degrees(math.atan2(self.ball_vy, self.ball_vx))
+        payload = {
+            "user_id": self.current_user_id,
+            "condition": self.condition_code,
+            "round_id": self.current_round,
+            "timestamp": dt.datetime.utcnow().isoformat() + "Z",
+            "event_type": event_type,
+            "ball_x": int(self.ball_x),
+            "ball_y": int(self.ball_y),
+            "human_x": int(self.human_x),
+            "human_y": int(self.human_y),
+            "agent_x": int(self.agent_x),
+            "agent_y": int(self.agent_y),
+            "triggered_by": triggered_by,
+            "signal_type": signal_type,
+            "dir_ratio": dir_ratio,
+            "ball_speed": round(speed, 3),
+            "ball_angle": round(angle, 3),
+        }
+        api_client.log_event(payload)
+
+    def start_experiment_api(self):
+        if self.current_user_id is None or self.condition_code is None:
+            return
+        self.exp_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+        self.exp_logged = False
+        api_client.start_experiment(
+            self.current_user_id,
+            self.condition_code,
+            self.total_rounds,
+            notes="",
+            exp_start_time=self.exp_start_iso,
+        )
+
+    def end_experiment_api(self):
+        if self.current_user_id is None or self.condition_code is None or self.exp_start_iso is None:
+            return
+        exp_end = dt.datetime.utcnow().isoformat() + "Z"
+        api_client.end_experiment(
+            self.current_user_id,
+            self.condition_code,
+            self.exp_start_iso,
+            exp_end,
+            self.total_rounds,
+            notes="",
+        )
+        self.exp_logged = True
+
+    def start_round_api(self):
+        if self.current_user_id is None or self.condition_code is None or self.round_start_iso is None:
+            return
+        agent_active, human_active = self._agent_human_flags()
+        api_client.start_round(
+            self.current_user_id,
+            self.condition_code,
+            self.current_round,
+            agent_active,
+            human_active,
+            self.round_start_iso,
+        )
+
+    def end_round_api(self):
+        if self.current_user_id is None or self.condition_code is None or self.round_start_iso is None:
+            return
+        agent_active, human_active = self._agent_human_flags()
+        round_end = dt.datetime.utcnow().isoformat() + "Z"
+        api_client.end_round(
+            self.current_user_id,
+            self.condition_code,
+            self.current_round,
+            self.round_start_iso,
+            round_end,
+            self.round_score,
+            self.round_errors,
+            self.round_collisions,
+            self.round_ball_spawn,
+            self.round_signal_sent,
+            self.round_ball_catch,
+            self.round_ball_miss,
+            agent_active,
+            human_active,
+        )
 
     def handle_events_round(self, event):
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
@@ -318,6 +458,10 @@ class Game:
 
     def go_home(self):
         # 回首頁時重置狀態，但保留已輸入的 user_id / condition（你要清空也可以改這裡）
+        if self.state == GameState.ROUND:
+            self.finish_round()
+        if self.exp_start_iso and not self.exp_logged:
+            self.end_experiment_api()
         self.state = GameState.HOME
         self.current_user_id = None
         self.condition_code = None
@@ -334,11 +478,21 @@ class Game:
         if self.current_round < self.total_rounds:
             self.current_round += 1
             self.reset_round_stats()
+            self.start_round_api()
             self.state = GameState.ROUND
             print(f"Start round {self.current_round}")
         else:
+            # 結束實驗
+            if not self.exp_logged and self.exp_start_iso:
+                self.end_experiment_api()
             self.state = GameState.DONE
             print("Experiment DONE")
+
+    def finish_round(self):
+        self.round_end_iso = dt.datetime.utcnow().isoformat() + "Z"
+        self.total_score += self.round_score
+        self.total_errors += self.round_errors
+        self.end_round_api()
 
     # --- 更新邏輯 ---
 
@@ -350,6 +504,10 @@ class Game:
         # 回合暫停時不更新物理也不結束計時
         if self.round_paused:
             return
+
+        # 接球冷卻（避免單次重疊多次得分）
+        if getattr(self, "hit_cooldown_ms", 0) > 0:
+            self.hit_cooldown_ms = max(0, self.hit_cooldown_ms - dt * 1000)
 
         # 衝突暫停：只凍結 paddle，球照常運動
         freeze_active = getattr(self, "conflict_freeze_ms", 0) > 0
@@ -367,12 +525,12 @@ class Game:
         # 邊界反彈
         if self.ball_x - BALL_R <= 0 or self.ball_x + BALL_R >= WIDTH:
             self.ball_vx *= -1
-            # 每次反彈旋轉角度 20~35 度
-            self.rotate_velocity(20, 35)
+            # 每次反彈旋轉角度 30~50 度
+            self.rotate_velocity(30, 50)
             self.clamp_ball_speed()
         if self.ball_y - BALL_R <= 0:
             self.ball_vy *= -1
-            self.rotate_velocity(20, 35)
+            self.rotate_velocity(30, 50)
             # 反彈後仍確保往下
             self.ball_vy = abs(self.ball_vy)
             self.clamp_ball_speed()
@@ -390,26 +548,26 @@ class Game:
             if keys[pg.K_DOWN]:
                 self.human_y += speed
 
-            # 代理 AI（暫時停用）
-            # agent_speed = 3
-            # if self.ball_x > self.agent_x + PADDLE_W / 2:
-            #     self.agent_x += agent_speed
-            # elif self.ball_x < self.agent_x + PADDLE_W / 2:
-            #     self.agent_x -= agent_speed
-            # jitter = random.uniform(-1.5, 1.5)
-            # target_y = self.ball_y + jitter * 40
-            # if target_y > self.agent_y + PADDLE_H / 2:
-            #     self.agent_y += agent_speed
-            # elif target_y < self.agent_y + PADDLE_H / 2:
-            #     self.agent_y -= agent_speed
+            # 代理 AI：朝球靠近，限制在下半部，增加 y 軸隨機性
+            agent_speed = 3
+            if self.ball_x > self.agent_x + PADDLE_W / 2:
+                self.agent_x += agent_speed
+            elif self.ball_x < self.agent_x + PADDLE_W / 2:
+                self.agent_x -= agent_speed
+            jitter = random.uniform(-1.5, 1.5)
+            target_y = self.ball_y + jitter * 40
+            if target_y > self.agent_y + PADDLE_H / 2:
+                self.agent_y += agent_speed
+            elif target_y < self.agent_y + PADDLE_H / 2:
+                self.agent_y -= agent_speed
 
         # 限制在人類/代理的工作區域（下半部）
         self.human_x = max(0, min(WIDTH - PADDLE_W, self.human_x))
         self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
 
-        # min_agent_y = int(HEIGHT * 0.55)  # 讓代理更貼近下方，不要卡在頂端
-        # self.agent_x = max(0, min(WIDTH - PADDLE_W, self.agent_x))
-        # self.agent_y = max(min_agent_y, min(HEIGHT - PADDLE_H, self.agent_y))
+        min_agent_y = int(HEIGHT * 0.55)  # 讓代理更貼近下方，不要卡在頂端
+        self.agent_x = max(0, min(WIDTH - PADDLE_W, self.agent_x))
+        self.agent_y = max(min_agent_y, min(HEIGHT - PADDLE_H, self.agent_y))
 
         # Agent 暫時固定不動（之後換成 DIR + rule-based 移動）
         # self.agent_x += 4
@@ -422,9 +580,7 @@ class Game:
         # 檢查回合時間是否結束
         elapsed = self.get_elapsed_ms()
         if elapsed >= ROUND_DURATION_MS:
-            # 回合結束，累計總成績
-            self.total_score += self.round_score
-            self.total_errors += self.round_errors
+            self.finish_round()
             self.state = GameState.BREAK
             print(
                 f"End round {self.current_round}: score={self.round_score}, "
@@ -434,46 +590,59 @@ class Game:
     def check_collisions(self):
         # 球和人類、代理人 paddle
         human_rect = pg.Rect(self.human_x, self.human_y, PADDLE_W, PADDLE_H)
-        # agent_rect = pg.Rect(self.agent_x, self.agent_y, PADDLE_W, PADDLE_H)
+        agent_rect = pg.Rect(self.agent_x, self.agent_y, PADDLE_W, PADDLE_H)
         ball_rect = pg.Rect(
             self.ball_x - BALL_R, self.ball_y - BALL_R, BALL_R * 2, BALL_R * 2
         )
 
         caught = False
 
-        if ball_rect.colliderect(human_rect):
+        if ball_rect.colliderect(human_rect) and self.hit_cooldown_ms <= 0:
             self.ball_vy = -abs(self.ball_vy)  # 向上彈
-            self.rotate_velocity(20, 35)
+            self.rotate_velocity(30, 50)
             self.ball_vy = -abs(self.ball_vy)
             self.clamp_ball_speed()
             self.round_score += 1
+            self.round_ball_catch += 1
             caught = True
+            self.hit_cooldown_ms = 250  # 0.25 秒內不重複加分
+            self.audio.play(self.audio.snd_drum)
+            self.log_event("ball_catch", triggered_by="human")
 
-        # if ball_rect.colliderect(agent_rect):
-        #     self.ball_vy = -abs(self.ball_vy)  # 同樣往上打
-        #     self.rotate_velocity(20, 35)
-        #     self.ball_vy = -abs(self.ball_vy)
-        #     self.clamp_ball_speed()
-        #     if not caught:
-        #         self.round_score += 1
-        #         caught = True
+        if ball_rect.colliderect(agent_rect) and self.hit_cooldown_ms <= 0:
+            self.ball_vy = -abs(self.ball_vy)  # 同樣往上打
+            self.rotate_velocity(30, 50)
+            self.ball_vy = -abs(self.ball_vy)
+            self.clamp_ball_speed()
+            if not caught:
+                self.round_score += 1
+                self.round_ball_catch += 1
+                caught = True
+            self.hit_cooldown_ms = 250
+            self.audio.play(self.audio.snd_drum)
+            self.log_event("ball_catch", triggered_by="agent")
 
         # 球落出畫面底部 → 失誤一次（paddle 不重置，球隨機重生）
         if self.ball_y - BALL_R > HEIGHT:
             self.round_errors += 1
+            self.round_ball_miss += 1
             self.reset_ball_random()
+            self.audio.play(self.audio.snd_denied)
+            self.log_event("ball_miss", triggered_by="system")
 
-        # # paddle 互相碰撞：彈開 + 閃爍（暫停）
-        # if human_rect.colliderect(agent_rect):
-        #     overlap = human_rect.clip(agent_rect)
-        #     push = overlap.height / 2 + 2
-        #     self.human_y += push
-        #     self.agent_y -= push
-        #     self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
-        #     self.agent_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.agent_y))
-        #     self.round_errors += 1
-        #     self.conflict_flash_ms = 300
-        #     self.conflict_freeze_ms = 300
+        # paddle 互相碰撞：彈開 + 閃爍（暫停）
+        if human_rect.colliderect(agent_rect):
+            overlap = human_rect.clip(agent_rect)
+            push = overlap.height / 2 + 2
+            self.human_y += push
+            self.agent_y -= push
+            self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
+            self.agent_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.agent_y))
+            self.round_collisions += 1
+            self.conflict_flash_ms = 300
+            self.conflict_freeze_ms = 300
+            self.audio.play(self.audio.snd_wrong)
+            self.log_event("paddle_collision", triggered_by="system")
 
     # --- 繪圖 ---
 
@@ -619,13 +788,13 @@ class Game:
             (int(self.human_x), int(self.human_y), PADDLE_W, PADDLE_H),
             border_radius=6,
         )
-
-        # pg.draw.rect(
-        #     self.screen,
-        #     agent_color,
-        #     (int(self.agent_x), int(self.agent_y), PADDLE_W, PADDLE_H),
-        #     border_radius=6,
-        # )
+        #agent 註解
+        pg.draw.rect(
+            self.screen,
+            agent_color,
+            (int(self.agent_x), int(self.agent_y), PADDLE_W, PADDLE_H),
+            border_radius=6,
+        )
 
         # 顯示 round 與 condition
         cond_label = CONDITIONS[self.condition_code][1] if self.condition_code else "N/A"
