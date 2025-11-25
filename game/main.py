@@ -108,12 +108,12 @@ class Game:
         # 球位置與速度改為隨機，避免每次都相同
         self.reset_ball_random()
 
-        # paddle 起始位置：人類在下半，代理在上半
+        # paddle 起始位置：人類在下半
         self.human_x = WIDTH // 2 - PADDLE_W // 2
         self.human_y = int(HEIGHT * 0.82)
 
-        self.agent_x = WIDTH // 2 - PADDLE_W // 2
-        self.agent_y = int(HEIGHT * 0.72)
+        # self.agent_x = WIDTH // 2 - PADDLE_W // 2
+        # self.agent_y = int(HEIGHT * 0.72)
 
     def reset_round_stats(self):
         self.round_score = 0
@@ -390,27 +390,26 @@ class Game:
             if keys[pg.K_DOWN]:
                 self.human_y += speed
 
-            # 代理簡單 AI：朝球靠近，限制在下半部，增加 y 軸隨機性
-            agent_speed = 3
-            if self.ball_x > self.agent_x + PADDLE_W / 2:
-                self.agent_x += agent_speed
-            elif self.ball_x < self.agent_x + PADDLE_W / 2:
-                self.agent_x -= agent_speed
-
-            jitter = random.uniform(-1.5, 1.5)
-            target_y = self.ball_y + jitter * 40
-            if target_y > self.agent_y + PADDLE_H / 2:
-                self.agent_y += agent_speed
-            elif target_y < self.agent_y + PADDLE_H / 2:
-                self.agent_y -= agent_speed
+            # 代理 AI（暫時停用）
+            # agent_speed = 3
+            # if self.ball_x > self.agent_x + PADDLE_W / 2:
+            #     self.agent_x += agent_speed
+            # elif self.ball_x < self.agent_x + PADDLE_W / 2:
+            #     self.agent_x -= agent_speed
+            # jitter = random.uniform(-1.5, 1.5)
+            # target_y = self.ball_y + jitter * 40
+            # if target_y > self.agent_y + PADDLE_H / 2:
+            #     self.agent_y += agent_speed
+            # elif target_y < self.agent_y + PADDLE_H / 2:
+            #     self.agent_y -= agent_speed
 
         # 限制在人類/代理的工作區域（下半部）
         self.human_x = max(0, min(WIDTH - PADDLE_W, self.human_x))
         self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
 
-        min_agent_y = int(HEIGHT * 0.55)  # 讓代理更貼近下方，不要卡在頂端
-        self.agent_x = max(0, min(WIDTH - PADDLE_W, self.agent_x))
-        self.agent_y = max(min_agent_y, min(HEIGHT - PADDLE_H, self.agent_y))
+        # min_agent_y = int(HEIGHT * 0.55)  # 讓代理更貼近下方，不要卡在頂端
+        # self.agent_x = max(0, min(WIDTH - PADDLE_W, self.agent_x))
+        # self.agent_y = max(min_agent_y, min(HEIGHT - PADDLE_H, self.agent_y))
 
         # Agent 暫時固定不動（之後換成 DIR + rule-based 移動）
         # self.agent_x += 4
@@ -435,7 +434,7 @@ class Game:
     def check_collisions(self):
         # 球和人類、代理人 paddle
         human_rect = pg.Rect(self.human_x, self.human_y, PADDLE_W, PADDLE_H)
-        agent_rect = pg.Rect(self.agent_x, self.agent_y, PADDLE_W, PADDLE_H)
+        # agent_rect = pg.Rect(self.agent_x, self.agent_y, PADDLE_W, PADDLE_H)
         ball_rect = pg.Rect(
             self.ball_x - BALL_R, self.ball_y - BALL_R, BALL_R * 2, BALL_R * 2
         )
@@ -450,33 +449,31 @@ class Game:
             self.round_score += 1
             caught = True
 
-        if ball_rect.colliderect(agent_rect):
-            self.ball_vy = -abs(self.ball_vy)  # 同樣往上打
-            self.rotate_velocity(20, 35)
-            self.ball_vy = -abs(self.ball_vy)
-            self.clamp_ball_speed()
-            if not caught:
-                self.round_score += 1
-                caught = True
+        # if ball_rect.colliderect(agent_rect):
+        #     self.ball_vy = -abs(self.ball_vy)  # 同樣往上打
+        #     self.rotate_velocity(20, 35)
+        #     self.ball_vy = -abs(self.ball_vy)
+        #     self.clamp_ball_speed()
+        #     if not caught:
+        #         self.round_score += 1
+        #         caught = True
 
         # 球落出畫面底部 → 失誤一次（paddle 不重置，球隨機重生）
         if self.ball_y - BALL_R > HEIGHT:
             self.round_errors += 1
             self.reset_ball_random()
 
-        # paddle 互相碰撞：彈開 + 閃爍
-        if human_rect.colliderect(agent_rect):
-            overlap = human_rect.clip(agent_rect)
-            push = overlap.height / 2 + 2
-            # 兩個都在下半部，往上下推開
-            self.human_y += push
-            self.agent_y -= push
-            self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
-            self.agent_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.agent_y))
-            # 衝突視為一次錯誤
-            self.round_errors += 1
-            self.conflict_flash_ms = 300
-            self.conflict_freeze_ms = 300
+        # # paddle 互相碰撞：彈開 + 閃爍（暫停）
+        # if human_rect.colliderect(agent_rect):
+        #     overlap = human_rect.clip(agent_rect)
+        #     push = overlap.height / 2 + 2
+        #     self.human_y += push
+        #     self.agent_y -= push
+        #     self.human_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.human_y))
+        #     self.agent_y = max(HEIGHT // 2, min(HEIGHT - PADDLE_H, self.agent_y))
+        #     self.round_errors += 1
+        #     self.conflict_flash_ms = 300
+        #     self.conflict_freeze_ms = 300
 
     # --- 繪圖 ---
 
@@ -623,12 +620,12 @@ class Game:
             border_radius=6,
         )
 
-        pg.draw.rect(
-            self.screen,
-            agent_color,
-            (int(self.agent_x), int(self.agent_y), PADDLE_W, PADDLE_H),
-            border_radius=6,
-        )
+        # pg.draw.rect(
+        #     self.screen,
+        #     agent_color,
+        #     (int(self.agent_x), int(self.agent_y), PADDLE_W, PADDLE_H),
+        #     border_radius=6,
+        # )
 
         # 顯示 round 與 condition
         cond_label = CONDITIONS[self.condition_code][1] if self.condition_code else "N/A"
