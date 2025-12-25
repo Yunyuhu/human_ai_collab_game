@@ -93,12 +93,9 @@ class Game:
         # 載入兩個準心圖（human_crosshair.png, ai_crosshair.png）並依 scale_factor 縮放
         self.human_cross_img = None
         self.ai_cross_img = None
-        self.target_img = None
-        self.ball_radius = BALL_R
         try:
             human_path = self.base_dir / "source" / "human_crosshair.png"
             ai_path = self.base_dir / "source" / "ai_crosshair.png"
-            target_path = self.base_dir / "source" / "fighter.png"
             # 以 128x128 為基準再乘上縮放因子
             scale_factor = 0.8
             target_size = int(128 * scale_factor)
@@ -110,26 +107,12 @@ class Game:
                 img_a = pg.image.load(str(ai_path)).convert_alpha()
                 img_a = pg.transform.smoothscale(img_a, (target_size, target_size))
                 self.ai_cross_img = img_a
-            if target_path.exists():
-                img_t = pg.image.load(str(target_path)).convert_alpha()
-                max_dim = max(img_t.get_width(), img_t.get_height())
-                desired = 48
-                if max_dim != desired and max_dim > 0:
-                    scale = desired / max_dim
-                    img_t = pg.transform.smoothscale(
-                        img_t,
-                        (max(1, int(img_t.get_width() * scale)), max(1, int(img_t.get_height() * scale))),
-                    )
-                self.target_img = img_t
-                self.ball_radius = max(1, int(max(img_t.get_width(), img_t.get_height()) / 2))
             if not (self.human_cross_img or self.ai_cross_img):
                 print("human_crosshair.png / ai_crosshair.png not found in source/, will draw procedural crosshairs.")
         except Exception as e:
             print("Failed to load crosshair images:", e)
             self.human_cross_img = None
             self.ai_cross_img = None
-            self.target_img = None
-            self.ball_radius = BALL_R
 
         # 狀態相關
         self.state = GameState.HOME
@@ -179,11 +162,9 @@ class Game:
     def reset_round_objects(self):
         """重置目標與準心等物件"""
         self.reset_ball_random()
-        # 初始位置避免重疊：左右偏移確保不在同一位置
-        offset = 100
-        self.human_x = max(50, WIDTH // 2 - offset)
+        self.human_x = WIDTH // 2
         self.human_y = int(HEIGHT * 0.82)
-        self.agent_x = min(WIDTH - 50, WIDTH // 2 + offset)
+        self.agent_x = WIDTH // 2
         self.agent_y = int(HEIGHT * 0.75)
         self.hit_cooldown_ms = 0
 
@@ -205,8 +186,6 @@ class Game:
         self.human_flash_ms = 0
         self.ai_flash_ms = 0
         self.conflict_freeze_ms = 0
-        # 衝突後的護欄期（ms）：暫停後允許短暫自動柔性分離（預設 0；會在發生衝突時設為 1000ms）
-        self.post_conflict_guard_ms = 0
 
     def reset_round_stats(self):
         self.round_score = 0
@@ -302,9 +281,6 @@ class Game:
         import random
         self.ball_x = random.uniform(40, WIDTH - 40)
         self.ball_y = -20
-        self.ball_spawn_y = self.ball_y
-        self.ai_aim_offset_x = random.uniform(-70.0, 70.0)
-        self.ai_aim_offset_y = random.uniform(-70.0, 70.0)
         self.ball_vx = random.uniform(-1.5, 1.5)
         self.ball_vy = random.uniform(2.0, 4.0)  # 始終往下移動
         self.clamp_ball_speed()
@@ -451,30 +427,26 @@ class Game:
             if event.key == pg.K_ESCAPE:
                 self.go_home()
 
-            # 人類按空白鍵發射（只有當目標進入準心圖片區域才可發射）
+            # 人類按空白鍵發射（只有當目標在內圈允許開火）
             if event.key == pg.K_SPACE:
                 now = time.time()
                 # 判斷是否冷卻完成
                 if now - getattr(self, "last_human_shot", 0.0) > getattr(self, "human_shot_cooldown", 0.25):
-                    # 計算準心圖片半徑（若有圖片用圖片尺寸，否則用 explosion_radius）
-                    if getattr(self, "human_cross_img", None):
-                        img_radius = self.human_cross_img.get_width() / 2.0
-                    else:
-                        img_radius = getattr(self, "explosion_radius", 48)
-                    # 只有當 ball 進入準心圖片區域才允許開火
+                    # 只有當 ball 在準心內圈（inner radius = explosion_radius * INNER_SHOOT_FACTOR）才允許開火
                     dist_to_ball = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
-                    if dist_to_ball <= img_radius:
-                        # 建立爆炸（實際命中仍由 create_explosion 判定 inner 1/3）
+                    inner_allowed = getattr(self, "explosion_radius", 48) * INNER_SHOOT_FACTOR
+                    if dist_to_ball <= inner_allowed:
+                        # 建立爆炸
                         self.create_explosion(self.human_x, self.human_y, "human", now)
                         self.last_human_shot = now
                         # 若另一方太靠近則會誤傷 -> 施加干擾
                         dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
                         if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
-                            # 友軍在爆炸預估視覺範圍內，施加誤傷效果（閃頻 + 暫停）
+                            # 友軍在爆炸範圍，施加誤傷效果（閃頻 + 暫停）
                             self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
                             self.log_event("friendly_fire", triggered_by="human")
                     else:
-                        # optional: 播放錯誤音或提示未在準心圖片範圍內
+                        # optional: 播放錯誤音或提示未在射程內（不強制）
                         pass
 
     def handle_events_break(self, event):
@@ -567,8 +539,6 @@ class Game:
             self.human_flash_ms = max(0, self.human_flash_ms - dt * 1000)
         if getattr(self, "ai_flash_ms", 0) > 0:
             self.ai_flash_ms = max(0, self.ai_flash_ms - dt * 1000)
-        if getattr(self, "post_conflict_guard_ms", 0) > 0:
-            self.post_conflict_guard_ms = max(0, self.post_conflict_guard_ms - dt * 1000)
 
         # 若衝突 freeze 正在進行，則略過移動/射擊行為
         if getattr(self, "conflict_freeze_ms", 0) > 0:
@@ -606,44 +576,21 @@ class Game:
             self.ball_vx = -abs(self.ball_vx) * 0.6
 
         # AI 對齊並在條件下引爆
-        agent_speed = 1.6
-        ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
-        ball_travel_total = max(1.0, HEIGHT - ball_spawn_y)
-        ball_travel_progress = (self.ball_y - ball_spawn_y) / ball_travel_total
-        if ball_travel_progress >= 0.25:
-            self.ai_aim_offset_x = getattr(self, "ai_aim_offset_x", 0.0)
-            self.ai_aim_offset_y = getattr(self, "ai_aim_offset_y", 0.0)
-            self.ai_aim_offset_x += random.uniform(-0.8, 0.8)
-            self.ai_aim_offset_y += random.uniform(-0.8, 0.8)
-            self.ai_aim_offset_x = max(-90.0, min(90.0, self.ai_aim_offset_x))
-            self.ai_aim_offset_y = max(-90.0, min(90.0, self.ai_aim_offset_y))
-            target_x = self.ball_x + self.ai_aim_offset_x
-            target_y = self.ball_y + self.ai_aim_offset_y
-            if self.agent_x < target_x - 6:
-                self.agent_x += agent_speed
-            elif self.agent_x > target_x + 6:
-                self.agent_x -= agent_speed
-            if self.agent_y < target_y - 6:
-                self.agent_y += agent_speed
-            elif self.agent_y > target_y + 6:
-                self.agent_y -= agent_speed
-            self.agent_x = max(0, min(WIDTH, self.agent_x))
-            self.agent_y = max(HEIGHT // 2, min(HEIGHT - 10, self.agent_y))
+        agent_speed = 3
+        if self.agent_x < self.ball_x - 2:
+            self.agent_x += agent_speed
+        elif self.agent_x > self.ball_x + 2:
+            self.agent_x -= agent_speed
 
         now = time.time()
-        # AI 射擊：需在「AI 準心圖片區域」內才會引爆；若太靠近人類則會造成友火干擾
+        # AI 射擊：需在射程內才會引爆；若太靠近人類則會造成友火干擾
         dist_agent_to_ball = math.hypot(self.ball_x - self.agent_x, self.ball_y - self.agent_y)
-        # 用 AI 圖片半徑做為可發射判定（若沒有圖片退回 explosion_radius）
-        if getattr(self, "ai_cross_img", None):
-            ai_img_radius = self.ai_cross_img.get_width() / 2.0
-        else:
-            ai_img_radius = getattr(self, "explosion_radius", 48)
-        if dist_agent_to_ball <= ai_img_radius:
+        if dist_agent_to_ball <= SHOOT_RANGE:
             if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
                 self.create_explosion(self.agent_x, self.agent_y, "agent", now)
                 self.last_ai_shot = now
-                # 檢查友火（以視覺半徑做判定）
-                dist_to_human = math.hypot(self.human_x - self.agent_x, self.agent_y - self.human_y)
+                # 檢查友火
+                dist_to_human = math.hypot(self.human_x - self.agent_x, self.human_y - self.agent_y)
                 if dist_to_human <= FRIENDLY_FIRE_RADIUS:
                     self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
                     self.log_event("friendly_fire", triggered_by="agent")
@@ -657,111 +604,48 @@ class Game:
                     pass
 
         # 檢查目標通過底線
-        ball_r = getattr(self, "ball_radius", BALL_R)
-        if self.ball_y - ball_r > HEIGHT:
+        if self.ball_y - BALL_R > HEIGHT:
             self.round_errors = getattr(self, "round_errors", 0) + 1
             self.log_event("ball_miss", triggered_by="system")
-            try:
-                denied_path = self.base_dir / "source" / "denied.mp3"
-                if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                    try:
-                        if hasattr(self.audio, "snd_denied"):
-                            self.audio.play(self.audio.snd_denied)
-                        else:
-                            s = pg.mixer.Sound(str(denied_path))
-                            self.audio.play(s)
-                    except Exception:
-                        try:
-                            pg.mixer.Sound(str(denied_path)).play()
-                        except Exception:
-                            pass
-                else:
-                    try:
-                        pg.mixer.Sound(str(denied_path)).play()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
             self.reset_ball_random()
 
         # 檢查準心重疊（靠太近會造成被動干擾）
         cross_dist = math.hypot(self.human_x - self.agent_x, self.human_y - self.agent_y)
         overlap_thresh = PADDLE_W * 0.6
         if cross_dist < overlap_thresh:
-            # 若正在護欄期（post_conflict_guard_ms），只做柔性分離（nudge），不重複計為衝突
-            if getattr(self, "post_conflict_guard_ms", 0) > 0:
-                try:
-                    dx = self.agent_x - self.human_x
-                    if abs(dx) < 1e-3:
-                        dx = 1.0
-                    # nudge magnitude 根據重疊量，但限制在小值，避免瞬間推開
-                    overlap_amount = max(0.0, overlap_thresh - cross_dist)
-                    nudge = min(8.0, overlap_amount * 0.6)
-                    nx = dx / math.hypot(dx, self.agent_y - self.human_y)
-                    # 向左右各小幅移動
-                    self.human_x = max(0, min(WIDTH, self.human_x - nx * nudge))
-                    self.agent_x = max(0, min(WIDTH, self.agent_x + nx * nudge))
-                except Exception:
-                    pass
-            else:
-                # 正常第一次檢測到重疊 -> 記錄為衝突並觸發 penalty（將暫停 0.5s）
-                self.apply_friendly_penalty("human", now, OVERLAP_PENALTY_SEC)
-                self.apply_friendly_penalty("agent", now, OVERLAP_PENALTY_SEC)
-                self.round_collisions += 1
-                # 記錄事件（一次即可）
-                self.log_event("crosshair_overlap", triggered_by="system")
+            # 當兩者重疊，立即施加短暫干擾（雙方）
+            self.apply_friendly_penalty("human", now, OVERLAP_PENALTY_SEC)
+            self.apply_friendly_penalty("agent", now, OVERLAP_PENALTY_SEC)
+            self.round_collisions += 1
+            # 記錄事件（一次即可）
+            self.log_event("crosshair_overlap", triggered_by="system")
 
     def create_explosion(self, x: float, y: float, owner: str, now: float) -> None:
         """在 (x,y) 產生短暫爆炸並立即檢查命中（不產生移動子彈）"""
         if not hasattr(self, "explosions"):
             self.explosions = []
-        # 播放射擊音（優先 AudioManager，否則 pygame.mixer）
-        try:
-            rifle_path = self.base_dir / "source" / "rifle.mp3"
-            if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                try:
-                    if hasattr(self.audio, "snd_rifle"):
-                        self.audio.play(self.audio.snd_rifle)
-                    else:
-                        s = pg.mixer.Sound(str(rifle_path))
-                        self.audio.play(s)
-                except Exception:
-                    try:
-                        pg.mixer.Sound(str(rifle_path)).play()
-                    except Exception:
-                        pass
-            else:
-                try:
-                    pg.mixer.Sound(str(rifle_path)).play()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
         exp = {"x": float(x), "y": float(y), "t": now, "dur": getattr(self, "explosion_duration", 0.28), "r": getattr(self, "explosion_radius", 48), "owner": owner}
         self.explosions.append(exp)
         # 立即檢查是否命中當前目標（ball）
         try:
             dist = math.hypot(self.ball_x - x, self.ball_y - y)
-            # 命中條件：在爆炸半徑的 INNER_SHOOT_FACTOR（例如 1/3）內才算命中
-            hit_radius = exp["r"] * INNER_SHOOT_FACTOR
-            if dist <= hit_radius:
+            if dist <= exp["r"]:
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.log_event("ball_hit", triggered_by=owner)
                 self.reset_ball_random()
-            # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
-            visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
+            # 檢查是否誤傷友軍（若開火時對方在爆炸半徑內）
+            # owner == "human" -> 檢查 agent 是否在範圍內； owner == "agent" -> 檢查 human
             if owner == "human":
                 dist_to_agent = math.hypot(self.agent_x - x, self.agent_y - y)
-                if dist_to_agent <= visual_r:
-                    # 友軍誤傷：閃頻並暫停
+                if dist_to_agent <= exp["r"]:
+                    # 友軍誤傷：閃頻並暫停 1 秒
                     self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
                     self.ai_flash_ms = max(getattr(self, "ai_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
                     self.log_event("friendly_fire", triggered_by="human")
             elif owner == "agent":
                 dist_to_human = math.hypot(self.human_x - x, self.human_y - y)
-                if dist_to_human <= visual_r:
+                if dist_to_human <= exp["r"]:
                     self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
                     self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
                     self.log_event("friendly_fire", triggered_by="agent")
@@ -774,6 +658,7 @@ class Game:
         對 human 或 agent 施加暫時干擾：
         - 設定 penalty_until（影響移動速度與射擊冷卻）
         - 觸發短暫停頓（conflict_freeze_ms）
+        - 對準心做「反彈」(push apart)
         - 播放錯誤聲（game/source/wrong.mp3）
         """
         # 設定 penalty 時間與延長冷卻
@@ -788,10 +673,22 @@ class Game:
             # ai flash ms
             self.ai_flash_ms = max(getattr(self, "ai_flash_ms", 0), int(dur * 1000))
 
-        # 衝突行為：暫停固定 0.5 秒（500 ms）
-        # 暫停結束後開啟護欄期 1.0 秒（1000 ms），在此期間允許重疊但會做柔性分離，不會再算新衝突
+        # 全域短暫停頓（所有準心停 dur 秒）
+        # 衝突後固定暫停 0.5 秒（500 ms）
         self.conflict_freeze_ms = max(getattr(self, "conflict_freeze_ms", 0.0), int(0.5 * 1000))
-        self.post_conflict_guard_ms = max(getattr(self, "post_conflict_guard_ms", 0.0), int(1.0 * 1000))
+
+        # 立即把兩個準心推開（簡單 x 軸推力）
+        try:
+            dx = getattr(self, "agent_x", 0) - getattr(self, "human_x", 0)
+            if abs(dx) < 1e-3:
+                dx = 1.0
+            push = 40.0
+            sign = dx / abs(dx)
+            # 向兩側各推半個 push 值
+            self.human_x = max(0, min(WIDTH, self.human_x - sign * (push * 0.5)))
+            self.agent_x = max(0, min(WIDTH, self.agent_x + sign * (push * 0.5)))
+        except Exception:
+            pass
 
         # 播放錯誤音（優先使用 AudioManager，失敗再用 pygame.mixer）
         try:
@@ -877,7 +774,8 @@ class Game:
         )
 
         # Start 按鈕
-        self.start_button_rect = pg.Rect(WIDTH // 2 - 100, 540, 200, 60)
+        if not getattr(self, "start_button_rect", None):
+            self.start_button_rect = pg.Rect(WIDTH // 2 - 100, 540, 200, 60)
         pg.draw.rect(self.screen, GRAY, self.start_button_rect, border_radius=8)
         draw_text(self.screen, "START", self.font_medium, WHITE, self.start_button_rect.center, center=True)
 
@@ -893,22 +791,8 @@ class Game:
 
     def draw_round(self):
         import pygame as pg
-
-        if WIDTH < 2 or HEIGHT < 2:
-            return
-
-        # 畫可移動範圍分界線（位於畫面高度的一半）
-        line_y = HEIGHT // 2
-        # 半透明橫線
-        line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
-        line_surf.fill((180, 180, 180, 140))
-        self.screen.blit(line_surf, (0, line_y - 1))
         # 畫下落目標
-        if getattr(self, "target_img", None):
-            rect = self.target_img.get_rect(center=(int(self.ball_x), int(self.ball_y)))
-            self.screen.blit(self.target_img, rect)
-        else:
-            pg.draw.circle(self.screen, WHITE, (int(self.ball_x), int(self.ball_y)), BALL_R)
+        pg.draw.circle(self.screen, WHITE, (int(self.ball_x), int(self.ball_y)), BALL_R)
 
         # 人類準心（圖片或 fallback）
         if getattr(self, "human_cross_img", None):
@@ -933,7 +817,7 @@ class Game:
             life = (time.time() - e["t"]) / e["dur"]
             # 視覺放大 EXPLOSION_VISUAL_SCALE 倍
             base_r = int(e["r"] * (0.6 + 0.8 * (1 - life)))
-            r = max(1, int(base_r * EXPLOSION_VISUAL_SCALE))
+            r = int(base_r * EXPLOSION_VISUAL_SCALE)
             alpha = int(220 * max(0.0, (1 - life)))
             surf = pg.Surface((r * 2 + 4, r * 2 + 4), flags=pg.SRCALPHA)
             color = (255, 200, 80) if e["owner"] == "agent" else (255, 90, 90)
@@ -1066,6 +950,292 @@ def main():
     game = Game()
     game.run()
 
+
+if __name__ == "__main__":
+    main()
+import pygame
+import time
+import json
+import threading
+import math
+import os
+from collections import deque
+from datetime import datetime
+
+# API client runs in background thread and exposes get_latest_action()
+from api_client import AIClient
+
+# --- config ---
+WIDTH, HEIGHT = 800, 600
+FPS = 60
+PLAYER_Y = HEIGHT - 60
+PLAYER_WIDTH = 40
+PLAYER_HEIGHT = 20
+PLAYER_BASE_SPEED = 5.0
+BULLET_SPEED = -8
+ENEMY_SPEED = 2.0
+MISS_LINE_Y = HEIGHT - 120
+CONFLICT_RANGE_NORM = 0.15  # normalized horizontal distance threshold (0..1)
+FRIENDLY_FIRE_RANGE_NORM = 0.10
+FRIENDLY_FIRE_PENALTY_SEC = 2.0
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# --- helper logger ---
+class Logger:
+    def __init__(self):
+        self.f = open(os.path.join(LOG_DIR, f"run_{int(time.time())}.logl"), "a")
+
+    def log_tick(self, tick, state, events):
+        rec = {
+            "ts": datetime.utcnow().isoformat(),
+            "tick": tick,
+            "state": state,
+            "events": events
+        }
+        self.f.write(json.dumps(rec) + "\n")
+        self.f.flush()
+
+    def close(self):
+        self.f.close()
+
+# --- game entities ---
+class Player:
+    def __init__(self, x, color, is_human=False):
+        self.x = x
+        self.y = PLAYER_Y
+        self.color = color
+        self.is_human = is_human
+        self.width = PLAYER_WIDTH
+        self.height = PLAYER_HEIGHT
+        self.speed = PLAYER_BASE_SPEED
+        self.slow_until = 0.0
+
+    def rect(self):
+        return pygame.Rect(self.x - self.width//2, self.y - self.height//2, self.width, self.height)
+
+    def apply_penalty(self, now, dur):
+        self.slow_until = max(self.slow_until, now + dur)
+
+    def get_speed_multiplier(self, now, conflict_mul):
+        mul = 1.0
+        if now < self.slow_until:
+            mul *= 0.4  # slowdown from friendly fire penalty
+        mul *= conflict_mul
+        return mul
+
+class Bullet:
+    def __init__(self, x, y, owner):
+        self.x = x
+        self.y = y
+        self.vy = BULLET_SPEED
+        self.owner = owner  # "human" or "ai"
+        self.alive = True
+
+    def update(self):
+        self.y += self.vy
+        if self.y < -10:
+            self.alive = False
+
+class Enemy:
+    def __init__(self, x, y= -20):
+        self.x = x
+        self.y = y
+        self.vy = ENEMY_SPEED
+        self.alive = True
+
+    def update(self):
+        self.y += self.vy
+
+# --- main game ---
+class Game:
+    def __init__(self, screen, ai_client):
+        self.screen = screen
+        self.clock = pygame.time.Clock()
+        self.ai_client = ai_client
+        self.human = Player(WIDTH*0.3, (0,200,0), is_human=True)
+        self.ai = Player(WIDTH*0.7, (0,0,200), is_human=False)
+        self.bullets = []
+        self.enemies = []
+        self.spawn_timer = 0.0
+        self.tick = 0
+        self.logger = Logger()
+        self.mistakes = 0
+        self.event_queue = deque(maxlen=100)
+
+    def spawn_enemy(self):
+        import random
+        x = random.randint(20, WIDTH-20)
+        e = Enemy(x)
+        self.enemies.append(e)
+
+    def handle_input(self, keys, now, conflict_mul):
+        # human control: left/right arrows and space to shoot
+        speed = PLAYER_BASE_SPEED * self.human.get_speed_multiplier(now, conflict_mul)
+        if keys[pygame.K_LEFT]:
+            self.human.x = max(20, self.human.x - speed)
+        if keys[pygame.K_RIGHT]:
+            self.human.x = min(WIDTH-20, self.human.x + speed)
+
+        # human shoot
+        if keys[pygame.K_SPACE]:
+            # throttle shooting per tick
+            if not any(b.owner=="human" and b.y > self.human.y-100 for b in self.bullets):
+                self.shoot(self.human, "human", now)
+
+    def apply_ai_action(self, action, now, conflict_mul):
+        # action: { "move": -1/0/1, "shoot": bool }
+        speed = PLAYER_BASE_SPEED * self.ai.get_speed_multiplier(now, conflict_mul)
+        move = action.get("move", 0)
+        self.ai.x = max(20, min(WIDTH-20, self.ai.x + move * speed))
+        if action.get("shoot", False):
+            self.shoot(self.ai, "ai", now)
+
+    def shoot(self, player, owner_tag, now):
+        # friendly fire check: if too close to other player, chance to cause friendly penalty
+        other = self.human if player is self.ai else self.ai
+        d = abs(player.x - other.x)
+        d_norm = d / WIDTH
+        # create bullet
+        b = Bullet(player.x, player.y - 10, owner_tag)
+        self.bullets.append(b)
+        # friendly fire risk
+        if d_norm < FRIENDLY_FIRE_RANGE_NORM:
+            # probability proportional to closeness
+            risk = (FRIENDLY_FIRE_RANGE_NORM - d_norm) / FRIENDLY_FIRE_RANGE_NORM
+            import random
+            if random.random() < risk:
+                # friendly hit occurs (no HP system needed) -> apply penalty to friendly player
+                other.apply_penalty(now, FRIENDLY_FIRE_PENALTY_SEC)
+                ev = {"type":"friendly_fire", "by": owner_tag, "affects": ("human" if other.is_human else "ai"), "d_norm": d_norm, "time": now}
+                self.event_queue.append(ev)
+
+    def update(self, dt):
+        now = time.time()
+        # spawn enemies periodically
+        self.spawn_timer += dt
+        if self.spawn_timer > 1.0:
+            self.spawn_timer = 0.0
+            self.spawn_enemy()
+
+        # compute normalized distance and conflict slowdown
+        d = abs(self.human.x - self.ai.x)
+        d_norm = d / WIDTH
+        if d_norm < CONFLICT_RANGE_NORM:
+            # conflict strength grows when closer
+            conflict_strength = 1.0 - (d_norm / CONFLICT_RANGE_NORM)
+            conflict_mul = max(0.2, 1.0 - 0.6 * conflict_strength)  # 40%~100% speed
+            self.event_queue.append({"type":"conflict", "d_norm": d_norm, "strength": conflict_strength, "time": now})
+        else:
+            conflict_mul = 1.0
+
+        # get AI action from client
+        ai_action = self.ai_client.get_latest_action() or {}
+
+        # handle human input
+        keys = pygame.key.get_pressed()
+        self.handle_input(keys, now, conflict_mul)
+        # apply AI
+        self.apply_ai_action(ai_action, now, conflict_mul)
+
+        # update bullets
+        for b in list(self.bullets):
+            b.update()
+            if not b.alive:
+                self.bullets.remove(b)
+
+        # update enemies
+        for e in list(self.enemies):
+            e.update()
+            # check bullet collisions
+            for b in list(self.bullets):
+                if abs(b.x - e.x) < 20 and abs(b.y - e.y) < 20:
+                    # bullet hits enemy
+                    e.alive = False
+                    b.alive = False
+                    self.event_queue.append({"type":"enemy_destroyed", "by": b.owner, "enemy_x": e.x, "time": now})
+            if not e.alive:
+                if e in self.enemies:
+                    self.enemies.remove(e)
+                continue
+
+            # check miss line
+            if e.y > MISS_LINE_Y:
+                # mistake
+                self.mistakes += 1
+                self.event_queue.append({"type":"missed_enemy", "enemy_x": e.x, "time": now})
+                if e in self.enemies:
+                    self.enemies.remove(e)
+
+        # friendly-fire bullet hitting other player (simulate)
+        for b in list(self.bullets):
+            target = self.human if b.owner=="ai" else self.ai
+            if abs(b.x - target.x) < 20 and abs(b.y - target.y) < 10:
+                # friendly fire hit; apply penalty
+                target.apply_penalty(now, FRIENDLY_FIRE_PENALTY_SEC)
+                self.event_queue.append({"type":"friendly_hit", "by": b.owner, "affects": ("human" if target.is_human else "ai"), "time": now})
+                try:
+                    self.bullets.remove(b)
+                except ValueError:
+                    pass
+
+        # prepare state for logging and to send to backend (ai_client can use this too)
+        state = {
+            "human_x": self.human.x,
+            "ai_x": self.ai.x,
+            "bullets": [{"x":b.x,"y":b.y,"owner":b.owner} for b in self.bullets],
+            "enemies": [{"x":e.x,"y":e.y} for e in self.enemies],
+            "mistakes": self.mistakes
+        }
+        # drain events
+        events = []
+        while self.event_queue:
+            events.append(self.event_queue.popleft())
+
+        self.logger.log_tick(self.tick, state, events)
+        self.tick += 1
+
+    def draw(self):
+        self.screen.fill((20,20,30))
+        # draw miss line
+        pygame.draw.line(self.screen, (200,50,50), (0, MISS_LINE_Y), (WIDTH, MISS_LINE_Y), 2)
+        # draw players
+        pygame.draw.rect(self.screen, self.human.color, self.human.rect())
+        pygame.draw.rect(self.screen, self.ai.color, self.ai.rect())
+        # draw bullets
+        for b in self.bullets:
+            pygame.draw.circle(self.screen, (255,255,0) if b.owner=="human" else (255,100,100), (int(b.x), int(b.y)), 4)
+        # draw enemies
+        for e in self.enemies:
+            pygame.draw.polygon(self.screen, (200,200,200), [(e.x, e.y), (e.x-12, e.y+18), (e.x+12, e.y+18)])
+        # HUD
+        font = pygame.font.SysFont(None, 24)
+        hud = font.render(f"mistakes: {self.mistakes}", True, (255,255,255))
+        self.screen.blit(hud, (10,10))
+
+    def run(self):
+        running = True
+        while running:
+            dt = self.clock.tick(FPS) / 1000.0
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    running = False
+            self.update(dt)
+            self.draw()
+            pygame.display.flip()
+        self.logger.close()
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Human-AI Cooperative Shooter")
+    # start AI client in background
+    ai_client = AIClient("ws://localhost:8000/ai/ws")
+    ai_client.start()  # thread-safe background
+    game = Game(screen, ai_client)
+    game.run()
+    ai_client.stop()
+    pygame.quit()
 
 if __name__ == "__main__":
     main()
