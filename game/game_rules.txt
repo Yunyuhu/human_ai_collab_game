@@ -1,0 +1,15 @@
+Game Rules (Summary)
+
+1) Roles
+- You are the red crosshair (human).
+- The agent is the orange crosshair.
+- Work together to hit the falling target.
+
+2) Controls
+- Move: left stick.
+- Shoot: A button (only when the target is inside the inner ring).
+
+3) Scoring
+- Score +1 when the target is hit by either side.
+- Conflicts +1 when crosshairs overlap and cause interference.
+- Errors +1 when the target falls past the bottom line.
