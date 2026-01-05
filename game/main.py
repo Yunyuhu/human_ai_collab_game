@@ -106,9 +106,10 @@ class Game:
         self.audio = AudioManager(str(self.base_dir))
         self.intro_overlay = IntroOverlay(
             [
-                self.base_dir / "source" / "game_into1.png",
-                self.base_dir / "source" / "game_into2.png",
-                self.base_dir / "source" / "game_into3.png",
+                self.base_dir / "source" / "game_info1.png",
+                self.base_dir / "source" / "game_info2.png",
+                self.base_dir / "source" / "game_info3.png",
+                self.base_dir / "source" / "game_info4.png",
             ]
         )
         self.voice_listener = None
@@ -181,7 +182,7 @@ class Game:
             if target_path.exists():
                 img_t = pg.image.load(str(target_path)).convert_alpha()
                 max_dim = max(img_t.get_width(), img_t.get_height())
-                desired = 56
+                desired = 65
                 if max_dim != desired and max_dim > 0:
                     scale = desired / max_dim
                     img_t = pg.transform.smoothscale(
@@ -198,6 +199,17 @@ class Game:
             self.ai_cross_img = None
             self.target_img = None
             self.ball_radius = BALL_R
+
+        if self.intro_overlay:
+            try:
+                self.intro_overlay.set_practice_assets(self.human_cross_img_base, self.target_img)
+                self.intro_overlay.set_practice_signal_assets(
+                    self.human_cross_img_my,
+                    self.human_cross_img_left,
+                    self.human_cross_img_right,
+                )
+            except Exception:
+                pass
 
         # 狀態相關
         self.state = GameState.HOME
@@ -319,6 +331,8 @@ class Game:
         self.ai_slow_factor = 1.0
         self.ai_aggressive_until = 0.0
         self.human_my_block_until = 0.0
+        self.ai_passive_until = 0.0
+        self.hide_mode_ui = False
         self.signal_sent_for_ball = False
 
         # 友火 / 干擾狀態
@@ -444,9 +458,16 @@ class Game:
                 print("Voice model not found:", self.voice_model_path)
                 return
         phrase_map = {
+            "我来": "human_my",
             "我可以": "human_my",
-            "交給你": "human_your",
+            "給我": "human_my",
+            "教給我": "human_my",
+            "交給我": "human_my",
             "交给你": "human_your",
+            "教给你": "human_your",
+            "你": "human_your",
+            "給你": "human_your",
+            "你去": "human_your",
         }
         self.voice_listener = VoiceSignalListener(
             model_path,
@@ -668,6 +689,9 @@ class Game:
                 elif num_buttons >= 6:
                     lt_pressed = lt_pressed or self.joystick.get_button(4)
                     rt_pressed = rt_pressed or self.joystick.get_button(5)
+                # Xbox Y (button 3) -> LT 行為
+                if num_buttons > 3:
+                    lt_pressed = lt_pressed or self.joystick.get_button(3)
             except Exception:
                 pass
 
@@ -699,6 +723,7 @@ class Game:
         if img is not None:
             self.human_cross_img = img
             self.human_icon_until = now + SIGNAL_ICON_DURATION
+            self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 3.0)
 
     def trigger_human_icon_my(self):
         if not self.human_active():
@@ -730,6 +755,33 @@ class Game:
         if img is not None:
             self.ai_cross_img = img
             self.agent_icon_until = now + 1.0
+        # 播放 Agent 訊號音效
+        try:
+            sound_path = None
+            if signal_type == "agent_my":
+                sound_path = self.base_dir / "source" / "agent_mysound.mp3"
+                if hasattr(self.audio, "snd_agent_my"):
+                    self.audio.play(self.audio.snd_agent_my)
+                    sound_path = None
+            elif signal_type in ("agent_your_left", "agent_your_right"):
+                sound_path = self.base_dir / "source" / "agent_yoursound.mp3"
+                if hasattr(self.audio, "snd_agent_your"):
+                    self.audio.play(self.audio.snd_agent_your)
+                    sound_path = None
+            if sound_path is not None:
+                try:
+                    s = pg.mixer.Sound(str(sound_path))
+                    if hasattr(self.audio, "play"):
+                        self.audio.play(s)
+                    else:
+                        s.play()
+                except Exception:
+                    try:
+                        pg.mixer.Sound(str(sound_path)).play()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def attempt_human_shot(self):
         if not self.human_active():
@@ -745,7 +797,7 @@ class Game:
             img_radius = getattr(self, "explosion_radius", 48)
         # 只有當 ball 進入準心圖片區域才允許開火
         dist_to_ball = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
-        if dist_to_ball <= img_radius:
+        if dist_to_ball <= img_radius * 1.1:
             # 建立爆炸（實際命中仍由 create_explosion 判定 inner 1/3）
             self.create_explosion(self.human_x, self.human_y, "human", now)
             self.last_human_shot = now
@@ -766,7 +818,7 @@ class Game:
         if not self.agent_signal_allowed():
             return
         # 只在畫面略高於 1/2 到 2/3 高度範圍內才隨機判斷是否發送
-        if self.ball_y < HEIGHT * 0.48 or self.ball_y > HEIGHT * 2 / 3:
+        if self.ball_y < HEIGHT * 0.46 or self.ball_y > HEIGHT * 2 / 3:
             return
         if random.random() > 0.5:
             return
@@ -796,6 +848,20 @@ class Game:
             if signal_type in ("agent_your_left", "agent_your_right"):
                 self.apply_agent_slow(now, 2.0, factor=0.5)
 
+    def update_agent_dir_behavior(self, now: float) -> None:
+        if not self.agent_active():
+            return
+        if self.ball_y < HEIGHT * 0.46 or self.ball_y > HEIGHT * 2 / 3:
+            return
+        dist_agent = math.hypot(self.ball_x - self.agent_x, self.ball_y - self.agent_y)
+        dist_human = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
+        denom = max(1e-6, dist_agent + dist_human)
+        dir_ratio = dist_agent / denom
+        if dir_ratio < 0.4:
+            self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 1.5)
+        elif dir_ratio > 0.6:
+            self.ai_passive_until = max(getattr(self, "ai_passive_until", 0.0), now + 1.5)
+
     def try_start_experiment(self):
         # 使用預設值啟動（已移除輸入欄位）
         self.current_user_id = 0
@@ -824,7 +890,7 @@ class Game:
         self.ai_aim_offset_x = random.uniform(-15.0, 15.0)
         self.ai_aim_offset_y = random.uniform(-15.0, 15.0)
         self.ball_vx = random.uniform(-1.5, 1.5)
-        self.ball_vy = random.uniform(2.0, 4.0)  # 始終往下移動
+        self.ball_vy = random.uniform(1.4, 3.0)  # 始終往下移動
         self.clamp_ball_speed()
         self.round_ball_spawn += 1
         self.log_event("ball_spawn", triggered_by="system")
@@ -993,7 +1059,7 @@ class Game:
             if event.button == 0:
                 self.attempt_human_shot()
             # LT/RT 有些裝置會回報為按鈕
-            if event.button in (6, 4):
+            if event.button in (6, 4, 3):
                 self.trigger_human_icon_left_right()
             if event.button in (7, 5):
                 self.trigger_human_icon_my()
@@ -1062,6 +1128,11 @@ class Game:
     # --- 更新邏輯 ---
 
     def update(self, dt):
+        if getattr(self, "show_intro", False) and self.intro_overlay:
+            try:
+                self.intro_overlay.update(dt, self.joystick, WIDTH, HEIGHT)
+            except Exception:
+                pass
         if getattr(self, "countdown_active", False):
             if time.time() >= getattr(self, "countdown_end_time", 0.0):
                 self.countdown_active = False
@@ -1100,7 +1171,7 @@ class Game:
         now = time.time()
         human_penalty_active = now < getattr(self, "human_penalty_until", 0.0)
         ai_penalty_active = now < getattr(self, "ai_penalty_until", 0.0)
-        human_speed = 2.5 * (0.4 if human_penalty_active else 1.0)
+        human_speed = 2.0 * (0.4 if human_penalty_active else 1.0)
         if self.human_active():
             if keys[pg.K_LEFT] or keys[pg.K_a]:
                 self.human_x -= human_speed
@@ -1147,6 +1218,7 @@ class Game:
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
+            self.update_agent_dir_behavior(now)
             self.maybe_send_agent_signal(now)
 
         # AI 對齊並在條件下引爆
@@ -1169,22 +1241,23 @@ class Game:
         aggressive = now < getattr(self, "ai_aggressive_until", 0.0) and now >= getattr(
             self, "human_my_block_until", 0.0
         )
+        passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
-        agent_speed = 1.6
+        agent_speed = 1.7
         if now < getattr(self, "ai_slow_until", 0.0):
             agent_speed *= getattr(self, "ai_slow_factor", 0.5)
         else:
             self.ai_slow_factor = 1.0
         if aggressive:
-            agent_speed *= 1.175
+            agent_speed *= 1.25
         ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
         ball_travel_total = max(1.0, HEIGHT - ball_spawn_y)
         ball_travel_progress = (self.ball_y - ball_spawn_y) / ball_travel_total
         if self.agent_active() and ai_active and ball_travel_progress >= 0.25:
             self.ai_aim_offset_x = getattr(self, "ai_aim_offset_x", 0.0)
             self.ai_aim_offset_y = getattr(self, "ai_aim_offset_y", 0.0)
-            jitter_scale = 0.675 if aggressive else 1.0
+            jitter_scale = 0.55 if aggressive else 1.0
             self.ai_aim_offset_x += random.uniform(-0.08, 0.08) * jitter_scale
             self.ai_aim_offset_y += random.uniform(-0.08, 0.08) * jitter_scale
             self.ai_aim_offset_x = max(-18.0, min(18.0, self.ai_aim_offset_x))
@@ -1211,13 +1284,20 @@ class Game:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
             if dist_agent_to_ball <= ai_img_radius:
                 if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
-                    self.create_explosion(self.agent_x, self.agent_y, "agent", now)
-                    self.last_ai_shot = now
-                    # 檢查友火（以視覺半徑做判定）
-                    dist_to_human = math.hypot(self.human_x - self.agent_x, self.agent_y - self.human_y)
-                    if dist_to_human <= FRIENDLY_FIRE_RADIUS:
-                        self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
-                        self.log_event("friendly_fire", triggered_by="agent")
+                    if aggressive:
+                        shot_chance = 0.85
+                    elif passive:
+                        shot_chance = 0.65
+                    else:
+                        shot_chance = 0.8
+                    if random.random() <= shot_chance:
+                        self.create_explosion(self.agent_x, self.agent_y, "agent", now)
+                        self.last_ai_shot = now
+                        # 檢查友火（以視覺半徑做判定）
+                        dist_to_human = math.hypot(self.human_x - self.agent_x, self.agent_y - self.human_y)
+                        if dist_to_human <= FRIENDLY_FIRE_RADIUS:
+                            self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
+                            self.log_event("friendly_fire", triggered_by="agent")
 
         # 更新爆炸列表（移除過期）
         for e in list(self.explosions):
@@ -1259,7 +1339,7 @@ class Game:
             self.reset_ball_random()
 
         # 檢查準心重疊（靠太近會造成被動干擾）
-        if self.human_active() and self.agent_active():
+        if self.human_active() and self.agent_active() and not getattr(self, "hide_mode_ui", False):
             cross_dist = math.hypot(self.human_x - self.agent_x, self.human_y - self.agent_y)
             overlap_thresh = PADDLE_W * 0.8
             if cross_dist < overlap_thresh:
@@ -1290,39 +1370,21 @@ class Game:
         """在 (x,y) 產生短暫爆炸並立即檢查命中（不產生移動子彈）"""
         if not hasattr(self, "explosions"):
             self.explosions = []
-        # 播放射擊音（優先 AudioManager，否則 pygame.mixer）
-        try:
-            rifle_path = self.base_dir / "source" / "rifle.mp3"
-            if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                try:
-                    if hasattr(self.audio, "snd_rifle"):
-                        self.audio.play(self.audio.snd_rifle)
-                    else:
-                        s = pg.mixer.Sound(str(rifle_path))
-                        self.audio.play(s)
-                except Exception:
-                    try:
-                        pg.mixer.Sound(str(rifle_path)).play()
-                    except Exception:
-                        pass
-            else:
-                try:
-                    pg.mixer.Sound(str(rifle_path)).play()
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
         exp = {"x": float(x), "y": float(y), "t": now, "dur": getattr(self, "explosion_duration", 0.28), "r": getattr(self, "explosion_radius", 48), "owner": owner}
         self.explosions.append(exp)
         # 立即檢查是否命中當前目標（ball）
+        hit = False
         try:
             dist = math.hypot(self.ball_x - x, self.ball_y - y)
             # 命中條件：在爆炸半徑的 INNER_SHOOT_FACTOR（例如 1/3）內才算命中
             hit_radius = exp["r"] * INNER_SHOOT_FACTOR
+            if owner == "human":
+                hit_radius *= 1.8
             if owner == "agent":
-                hit_radius = exp["r"] * 0.65
+                hit_radius = exp["r"] * 0.8
             if dist <= hit_radius:
+                hit = True
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.log_event("ball_hit", triggered_by=owner)
@@ -1344,6 +1406,26 @@ class Game:
                     self.log_event("friendly_fire", triggered_by="agent")
         except AttributeError:
             # 若目前沒有 ball_x/ball_y，安全忽略
+            pass
+        # 播放射擊 / 命中音（優先 AudioManager，否則 pygame.mixer）
+        try:
+            sound_name = "rifle.mp3" if hit else "shoot.mp3"
+            sound_path = self.base_dir / "source" / sound_name
+            if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                try:
+                    s = pg.mixer.Sound(str(sound_path))
+                    self.audio.play(s)
+                except Exception:
+                    try:
+                        pg.mixer.Sound(str(sound_path)).play()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    pg.mixer.Sound(str(sound_path)).play()
+                except Exception:
+                    pass
+        except Exception:
             pass
 
     def apply_friendly_penalty(self, target: str, now: float, dur: float = FRIENDLY_FIRE_PENALTY_SEC) -> None:
