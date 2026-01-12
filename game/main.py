@@ -13,6 +13,7 @@ import api_client
 from audio import AudioManager
 from ui_mode_selector import ModeSelector
 from ui_signal_selector import SignalSelector
+from ui_agent_speed_selector import AgentSpeedSelector
 from voice_signal import VoiceSignalListener
 from ui_intro_overlay import IntroOverlay
 
@@ -28,10 +29,12 @@ LIGHT_GRAY = (150, 150, 150)
 BLUE = (100, 180, 255)
 ORANGE = (255, 170, 120)
 BG_COLOR = (20, 20, 30)
+PRACTICE_BG_COLOR = (40, 20, 70)
+EXPERIMENT_BG_COLOR = (10, 30, 80)
 
 # 遊戲設定
-ROUND_DURATION_MS = 60_000  # 每回合 60 秒
-TOTAL_ROUNDS = 3
+ROUND_DURATION_MS = 120_000  # 每回合 120 秒
+TOTAL_ROUNDS = 4
 
 PADDLE_W, PADDLE_H = 100, 20
 BALL_R = 10
@@ -217,6 +220,9 @@ class Game:
         self.pending_start = False
         self.countdown_active = False
         self.countdown_end_time = 0.0
+        self.countdown_start_ms = None
+        self.info_pause_start_ms = None
+        self.restart_pending = False
         self.human_icon_until = 0.0
         self.joystick_axes = []
         self.lt_latched = False
@@ -275,6 +281,18 @@ class Game:
             options=self.mode_options,
             initial_key=self.control_mode,
         )
+        self.agent_speed_options = {
+            "A": "A mode",
+            "B": "B mode",
+            "C": "C mode",
+        }
+        self.agent_speed_mode = "A"
+        self.agent_speed_selector = AgentSpeedSelector(
+            rect=pg.Rect(0, 0, 250, 28),
+            font=self.font_tiny,
+            options=self.agent_speed_options,
+            initial_key=self.agent_speed_mode,
+        )
         self.signal_options = {
             "no_signal": "No Signal",
             "human_dom": "Human Dominant",
@@ -289,6 +307,15 @@ class Game:
         )
         self.info_button_rect = pg.Rect(0, 0, 28, 28)
         self.info_button_rect.topright = (WIDTH - 12, 10)
+        self.pause_button_rect = pg.Rect(0, 0, 28, 28)
+        self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
+        self.pause_overlay_active = False
+        self.pause_continue_rect = None
+        self.pause_restart_rect = None
+        self.pause_home_rect = None
+        self.user_id_text = ""
+        self.user_id_active = False
+        self.user_id_rect = pg.Rect(0, 0, 260, 36)
 
         # 搖桿支援
         self.joystick = None
@@ -312,7 +339,7 @@ class Game:
         self.human_x = max(50, WIDTH // 2 - offset)
         self.human_y = int(HEIGHT * 0.82)
         self.agent_x = min(WIDTH - 50, WIDTH // 2 + offset)
-        self.agent_y = int(HEIGHT * 0.75)
+        self.agent_y = self.human_y
         self.hit_cooldown_ms = 0
 
         # 改為使用爆炸效果（取代子彈）
@@ -330,9 +357,12 @@ class Game:
         self.ai_slow_until = 0.0
         self.ai_slow_factor = 1.0
         self.ai_aggressive_until = 0.0
+        self.ai_aggressive_boost_until = 0.0
         self.human_my_block_until = 0.0
         self.ai_passive_until = 0.0
         self.hide_mode_ui = False
+        self.agent_close_shot_time = None
+        self.agent_close_shot_due = None
         self.signal_sent_for_ball = False
 
         # 友火 / 干擾狀態
@@ -355,7 +385,7 @@ class Game:
         self.rt_prev = None
         self.joystick_axes = []
 
-    def reset_round_stats(self):
+    def reset_round_stats(self, start_timer: bool = True):
         self.round_score = 0
         self.round_errors = 0
         self.round_collisions = 0
@@ -363,10 +393,17 @@ class Game:
         self.round_signal_sent = 0
         self.round_ball_catch = 0
         self.round_ball_miss = 0
-        self.round_start_ms = pg.time.get_ticks()
-        self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+        if start_timer:
+            self.round_start_ms = pg.time.get_ticks()
+            self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+        else:
+            self.round_start_ms = None
+            self.round_start_iso = None
         self.reset_round_objects()
         self.conflict_flash_ms = 0
+        self.break_next_rect = None
+        self.break_restart_rect = None
+        self.break_home_rect = None
 
     def get_elapsed_ms(self):
         """回傳本回合已經過的毫秒數（扣掉暫停時間）"""
@@ -402,10 +439,14 @@ class Game:
                 result = self.intro_overlay.handle_event(event)
                 if result == "close":
                     self.show_intro = False
+                    self.end_info_pause()
                     if self.pending_start or self.state == GameState.ROUND:
-                        self.start_countdown()
+                        self.start_countdown(3)
                 if result:
                     continue
+            if getattr(self, "pause_overlay_active", False):
+                self.handle_events_pause(event)
+                continue
             if getattr(self, "countdown_active", False):
                 continue
 
@@ -422,19 +463,53 @@ class Game:
         # 首頁只保留 Start 按鈕（假設 self.start_button_rect 已建立）
         import pygame as pg
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if self.mode_selector.handle_event(event):
+                self.control_mode = self.mode_selector.selected
+                return
+            if self.signal_selector.handle_event(event):
+                self.signal_mode = self.signal_selector.selected
+                self.condition_code = CONDITION_BY_MODE[self.signal_mode]
+                return
+            if self.agent_speed_selector.handle_event(event):
+                self.agent_speed_mode = self.agent_speed_selector.selected
+                return
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             if getattr(self, "start_button_rect", None) and self.start_button_rect.collidepoint(event.pos):
+                if not self.user_id_text.strip():
+                    return
                 self.try_start_experiment()
+                self.pending_start = True
+                self.begin_info_pause()
                 self.intro_overlay.index = 0
                 self.show_intro = True
+            if self.user_id_rect.collidepoint(event.pos):
+                self.user_id_active = True
+            else:
+                self.user_id_active = False
         if event.type == pg.KEYDOWN:
+            if self.user_id_active:
+                if event.key == pg.K_BACKSPACE:
+                    self.user_id_text = self.user_id_text[:-1]
+                    return
+                if event.unicode and event.unicode.isprintable() and len(self.user_id_text) < 24:
+                    self.user_id_text += event.unicode
+                    return
             # Enter 鍵也可啟動
             if event.key == pg.K_RETURN or event.key == pg.K_KP_ENTER:
+                if not self.user_id_text.strip():
+                    return
                 self.try_start_experiment()
+                self.pending_start = True
+                self.begin_info_pause()
                 self.intro_overlay.index = 0
                 self.show_intro = True
         if event.type == pg.JOYBUTTONDOWN:
             if event.button == 0:
+                if not self.user_id_text.strip():
+                    return
                 self.try_start_experiment()
+                self.pending_start = True
+                self.begin_info_pause()
                 self.intro_overlay.index = 0
                 self.show_intro = True
 
@@ -445,7 +520,10 @@ class Game:
         self.screen = pg.display.set_mode((WIDTH, HEIGHT), pg.RESIZABLE)
         self.mode_selector.set_position(12, 10)
         self.signal_selector.set_position(self.mode_selector.rect.right + 12, 10)
+        self.agent_speed_selector.set_position(self.signal_selector.rect.right + 12, 10)
         self.info_button_rect.topright = (WIDTH - 12, 10)
+        self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
+        self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
 
     def init_voice_listener(self):
         model_path = self.voice_model_path
@@ -570,12 +648,20 @@ class Game:
     def start_countdown(self, seconds: int = 3):
         self.countdown_active = True
         self.countdown_end_time = time.time() + max(1, seconds)
+        self.countdown_start_ms = pg.time.get_ticks()
+
+    def begin_info_pause(self):
+        if self.state == GameState.ROUND and self.info_pause_start_ms is None:
+            self.info_pause_start_ms = pg.time.get_ticks()
+
+    def end_info_pause(self):
+        if self.state == GameState.ROUND and self.info_pause_start_ms is not None:
+            if self.round_start_ms is not None:
+                paused_ms = pg.time.get_ticks() - self.info_pause_start_ms
+                self.round_start_ms += paused_ms
+            self.info_pause_start_ms = None
 
     def update_trigger_icons(self, now: float) -> None:
-        if now < getattr(self, "human_icon_until", 0.0):
-            return
-        if self.human_cross_img_base is not None:
-            self.human_cross_img = self.human_cross_img_base
         if not self.human_signal_allowed():
             return
         keys = pg.key.get_pressed()
@@ -606,10 +692,7 @@ class Game:
                 self.trigger_human_icon_left_right()
 
     def update_agent_icon(self, now: float) -> None:
-        if now < getattr(self, "agent_icon_until", 0.0):
-            return
-        if self.ai_cross_img_base is not None:
-            self.ai_cross_img = self.ai_cross_img_base
+        return
 
     def read_trigger_buttons(self):
         if not self.joystick:
@@ -714,8 +797,6 @@ class Game:
         if not self.human_signal_allowed():
             return
         now = time.time()
-        if now < getattr(self, "human_icon_until", 0.0):
-            return
         if self.agent_x < self.human_x:
             img = self.human_cross_img_left
         else:
@@ -723,7 +804,8 @@ class Game:
         if img is not None:
             self.human_cross_img = img
             self.human_icon_until = now + SIGNAL_ICON_DURATION
-            self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 3.0)
+            self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 4.0)
+            self.ai_aggressive_boost_until = max(getattr(self, "ai_aggressive_boost_until", 0.0), now + 4.0)
 
     def trigger_human_icon_my(self):
         if not self.human_active():
@@ -731,20 +813,17 @@ class Game:
         if not self.human_signal_allowed():
             return
         now = time.time()
-        if now < getattr(self, "human_icon_until", 0.0):
-            return
         if self.human_cross_img_my is not None:
             self.human_cross_img = self.human_cross_img_my
             self.human_icon_until = now + SIGNAL_ICON_DURATION
             self.apply_agent_slow(now, 3.0, factor=0.25)
             self.ai_aggressive_until = 0.0
             self.human_my_block_until = now + 2.5
+            self.ai_passive_until = max(getattr(self, "ai_passive_until", 0.0), now + 3.0)
             self.round_signal_sent += 1
             self.log_event("signal_sent", triggered_by="human", signal_type="human_my")
 
     def trigger_agent_icon(self, signal_type: str, now: float) -> None:
-        if now < getattr(self, "agent_icon_until", 0.0):
-            return
         img = None
         if signal_type == "agent_my":
             img = self.ai_cross_img_my
@@ -818,7 +897,7 @@ class Game:
         if not self.agent_signal_allowed():
             return
         # 只在畫面略高於 1/2 到 2/3 高度範圍內才隨機判斷是否發送
-        if self.ball_y < HEIGHT * 0.46 or self.ball_y > HEIGHT * 2 / 3:
+        if self.ball_y < HEIGHT * 0.4 or self.ball_y > HEIGHT * 2 / 3:
             return
         if random.random() > 0.5:
             return
@@ -849,22 +928,14 @@ class Game:
                 self.apply_agent_slow(now, 2.0, factor=0.5)
 
     def update_agent_dir_behavior(self, now: float) -> None:
-        if not self.agent_active():
-            return
-        if self.ball_y < HEIGHT * 0.46 or self.ball_y > HEIGHT * 2 / 3:
-            return
-        dist_agent = math.hypot(self.ball_x - self.agent_x, self.ball_y - self.agent_y)
-        dist_human = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
-        denom = max(1e-6, dist_agent + dist_human)
-        dir_ratio = dist_agent / denom
-        if dir_ratio < 0.4:
-            self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 1.5)
-        elif dir_ratio > 0.6:
-            self.ai_passive_until = max(getattr(self, "ai_passive_until", 0.0), now + 1.5)
+        return
 
     def try_start_experiment(self):
         # 使用預設值啟動（已移除輸入欄位）
-        self.current_user_id = 0
+        if self.user_id_text.isdigit():
+            self.current_user_id = int(self.user_id_text)
+        else:
+            self.current_user_id = 0
         self.condition_code = CONDITION_BY_MODE.get(self.signal_mode, 1)
         self.current_round = 1
         # 重置總成績
@@ -872,8 +943,7 @@ class Game:
         self.total_errors = 0
         self.start_experiment_api()
         # 進入第一回合
-        self.reset_round_stats()
-        self.start_round_api()
+        self.reset_round_stats(start_timer=False)
         self.state = GameState.ROUND
         print(
             f"Start experiment: user_id={self.current_user_id}, "
@@ -887,6 +957,10 @@ class Game:
         self.ball_y = -20
         self.ball_spawn_y = self.ball_y
         self.signal_sent_for_ball = False
+        if self.human_cross_img_base is not None:
+            self.human_cross_img = self.human_cross_img_base
+        if self.ai_cross_img_base is not None:
+            self.ai_cross_img = self.ai_cross_img_base
         self.ai_aim_offset_x = random.uniform(-15.0, 15.0)
         self.ai_aim_offset_y = random.uniform(-15.0, 15.0)
         self.ball_vx = random.uniform(-1.5, 1.5)
@@ -1031,9 +1105,16 @@ class Game:
                 self.signal_mode = self.signal_selector.selected
                 self.condition_code = CONDITION_BY_MODE[self.signal_mode]
                 return
+            if self.agent_speed_selector.handle_event(event):
+                self.agent_speed_mode = self.agent_speed_selector.selected
+                return
             if self.info_button_rect.collidepoint(event.pos):
+                self.begin_info_pause()
                 self.intro_overlay.index = 0
                 self.show_intro = True
+                return
+            if self.pause_button_rect.collidepoint(event.pos):
+                self.pause_overlay_active = True
                 return
             mic_center = (WIDTH // 2, 18)
             if (event.pos[0] - mic_center[0]) ** 2 + (event.pos[1] - mic_center[1]) ** 2 <= 12 ** 2:
@@ -1043,6 +1124,8 @@ class Game:
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_ESCAPE:
                 self.go_home()
+            if event.key == pg.K_p:
+                self.pause_overlay_active = True
 
             # 人類按空白鍵發射（只有當目標進入準心圖片區域才可發射）
             if event.key == pg.K_SPACE:
@@ -1075,20 +1158,41 @@ class Game:
             # 下一回合 / 結束
             if event.key == pg.K_SPACE:
                 self.go_next_round_or_done()
+            elif event.key == pg.K_r:
+                self.restart_round()
             elif event.key == pg.K_h:
                 self.go_home()
 
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
-            # 在 BREAK 畫面中，簡單把畫面中間的文字當「按鈕」
-            center_rect = pg.Rect(0, 0, 400, 60)
-            center_rect.center = (WIDTH // 2, HEIGHT // 2 + 80)
-            if center_rect.collidepoint(event.pos):
+            if self.break_home_rect and self.break_home_rect.collidepoint(event.pos):
+                self.go_home()
+            elif self.break_restart_rect and self.break_restart_rect.collidepoint(event.pos):
+                self.restart_round()
+            elif self.break_next_rect and self.break_next_rect.collidepoint(event.pos):
                 self.go_next_round_or_done()
 
     def handle_events_done(self, event):
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_h:
                 self.go_home()
+
+    def handle_events_pause(self, event):
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                self.pause_overlay_active = False
+                return
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if self.pause_continue_rect and self.pause_continue_rect.collidepoint(event.pos):
+                self.pause_overlay_active = False
+                return
+            if self.pause_restart_rect and self.pause_restart_rect.collidepoint(event.pos):
+                self.pause_overlay_active = False
+                self.restart_round()
+                return
+            if self.pause_home_rect and self.pause_home_rect.collidepoint(event.pos):
+                self.pause_overlay_active = False
+                self.go_home()
+                return
 
     def go_home(self):
         # 回首頁時重置狀態，但保留已輸入的 user_id / condition（你要清空也可以改這裡）
@@ -1097,6 +1201,8 @@ class Game:
         if self.exp_start_iso and not self.exp_logged:
             self.end_experiment_api()
         self.state = GameState.HOME
+        self.pending_start = False
+        self.restart_pending = False
         self.current_user_id = None
         self.condition_code = None
         self.current_round = 0
@@ -1119,6 +1225,15 @@ class Game:
             self.state = GameState.DONE
             print("Experiment DONE")
 
+    def restart_round(self):
+        if self.state not in (GameState.BREAK, GameState.ROUND):
+            return
+        self.reset_round_stats(start_timer=False)
+        self.restart_pending = True
+        self.state = GameState.ROUND
+        self.start_countdown(3)
+        print(f"Restart round {self.current_round}")
+
     def finish_round(self):
         self.round_end_iso = dt.datetime.utcnow().isoformat() + "Z"
         self.total_score += self.round_score
@@ -1127,39 +1242,58 @@ class Game:
 
     # --- 更新邏輯 ---
 
-    def update(self, dt):
+    def update(self, delta):
         if getattr(self, "show_intro", False) and self.intro_overlay:
             try:
-                self.intro_overlay.update(dt, self.joystick, WIDTH, HEIGHT)
+                self.intro_overlay.update(delta, self.joystick, WIDTH, HEIGHT)
             except Exception:
                 pass
+            return
+        if getattr(self, "pause_overlay_active", False):
+            return
         if getattr(self, "countdown_active", False):
             if time.time() >= getattr(self, "countdown_end_time", 0.0):
                 self.countdown_active = False
+                if self.state == GameState.ROUND and self.round_start_ms is not None and self.countdown_start_ms:
+                    paused_ms = pg.time.get_ticks() - self.countdown_start_ms
+                    self.round_start_ms += paused_ms
+                self.countdown_start_ms = None
                 if self.pending_start:
                     self.pending_start = False
-                    self.try_start_experiment()
+                    self.round_start_ms = pg.time.get_ticks()
+                    self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+                    self.start_round_api()
+                if self.restart_pending:
+                    self.restart_pending = False
+                    self.round_start_ms = pg.time.get_ticks()
+                    self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+                    self.start_round_api()
             else:
                 return
         if self.state == GameState.ROUND:
-            self.update_round(dt)
+            self.update_round(delta)
 
-    def update_round(self, dt):
+    def update_round(self, delta):
         import random
         if getattr(self, "show_intro", False):
             return
         if getattr(self, "countdown_active", False):
             return
+        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
+        if self.get_elapsed_ms() >= round_duration_ms:
+            self.finish_round()
+            self.state = GameState.BREAK
+            return
 
         # 更新 freeze/flash 計時（ms）
         if getattr(self, "conflict_freeze_ms", 0) > 0:
-            self.conflict_freeze_ms = max(0, self.conflict_freeze_ms - dt * 1000)
+            self.conflict_freeze_ms = max(0, self.conflict_freeze_ms - delta * 1000)
         if getattr(self, "human_flash_ms", 0) > 0:
-            self.human_flash_ms = max(0, self.human_flash_ms - dt * 1000)
+            self.human_flash_ms = max(0, self.human_flash_ms - delta * 1000)
         if getattr(self, "ai_flash_ms", 0) > 0:
-            self.ai_flash_ms = max(0, self.ai_flash_ms - dt * 1000)
+            self.ai_flash_ms = max(0, self.ai_flash_ms - delta * 1000)
         if getattr(self, "post_conflict_guard_ms", 0) > 0:
-            self.post_conflict_guard_ms = max(0, self.post_conflict_guard_ms - dt * 1000)
+            self.post_conflict_guard_ms = max(0, self.post_conflict_guard_ms - delta * 1000)
 
         # 若衝突 freeze 正在進行，則略過移動/射擊行為
         if getattr(self, "conflict_freeze_ms", 0) > 0:
@@ -1171,7 +1305,7 @@ class Game:
         now = time.time()
         human_penalty_active = now < getattr(self, "human_penalty_until", 0.0)
         ai_penalty_active = now < getattr(self, "ai_penalty_until", 0.0)
-        human_speed = 2.0 * (0.4 if human_penalty_active else 1.0)
+        human_speed = 2.4 * (0.4 if human_penalty_active else 1.0)
         if self.human_active():
             if keys[pg.K_LEFT] or keys[pg.K_a]:
                 self.human_x -= human_speed
@@ -1218,7 +1352,6 @@ class Game:
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
-            self.update_agent_dir_behavior(now)
             self.maybe_send_agent_signal(now)
 
         # AI 對齊並在條件下引爆
@@ -1232,7 +1365,7 @@ class Game:
             if dist_agent_to_ball < 220:
                 self.ai_track_until = now + random.uniform(1.0, 1.8)
                 ai_active = True
-            elif random.random() < 0.8:
+            elif random.random() < 0.75:
                 self.ai_track_until = now + random.uniform(0.8, 1.6)
                 ai_active = True
             else:
@@ -1241,6 +1374,13 @@ class Game:
         aggressive = now < getattr(self, "ai_aggressive_until", 0.0) and now >= getattr(
             self, "human_my_block_until", 0.0
         )
+        if self.agent_speed_mode in ("B", "C") and now >= getattr(self, "human_my_block_until", 0.0):
+            aggressive = True
+        aggressive_boost = now < getattr(self, "ai_aggressive_boost_until", 0.0)
+        if self.agent_speed_mode == "B" and now >= getattr(self, "human_my_block_until", 0.0):
+            aggressive_boost = False
+        elif self.agent_speed_mode == "C" and now >= getattr(self, "human_my_block_until", 0.0):
+            aggressive_boost = True
         passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
@@ -1249,21 +1389,48 @@ class Game:
             agent_speed *= getattr(self, "ai_slow_factor", 0.5)
         else:
             self.ai_slow_factor = 1.0
-        if aggressive:
+        if aggressive_boost and self.agent_speed_mode == "C":
+            agent_speed *= 1.4
+        elif aggressive and self.agent_speed_mode == "B":
+            agent_speed *= 1.15
+        elif aggressive:
             agent_speed *= 1.25
+        elif passive:
+            agent_speed *= 0.85
         ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
         ball_travel_total = max(1.0, HEIGHT - ball_spawn_y)
         ball_travel_progress = (self.ball_y - ball_spawn_y) / ball_travel_total
-        if self.agent_active() and ai_active and ball_travel_progress >= 0.25:
+        if self.agent_active() and ai_active and ball_travel_progress >= 0.15:
             self.ai_aim_offset_x = getattr(self, "ai_aim_offset_x", 0.0)
             self.ai_aim_offset_y = getattr(self, "ai_aim_offset_y", 0.0)
-            jitter_scale = 0.55 if aggressive else 1.0
+            if aggressive_boost and self.agent_speed_mode == "C":
+                jitter_scale = 0.45
+            elif aggressive and self.agent_speed_mode == "B":
+                jitter_scale = 0.7
+            elif aggressive:
+                jitter_scale = 0.55
+            elif passive:
+                jitter_scale = 1.1
+            else:
+                jitter_scale = 1.0
             self.ai_aim_offset_x += random.uniform(-0.08, 0.08) * jitter_scale
             self.ai_aim_offset_y += random.uniform(-0.08, 0.08) * jitter_scale
             self.ai_aim_offset_x = max(-18.0, min(18.0, self.ai_aim_offset_x))
             self.ai_aim_offset_y = max(-18.0, min(18.0, self.ai_aim_offset_y))
             target_x = self.ball_x + self.ai_aim_offset_x
             target_y = self.ball_y + self.ai_aim_offset_y
+            close_lock = False
+            if getattr(self, "ai_cross_img", None):
+                close_lock = dist_agent_to_ball <= (self.ai_cross_img.get_width() / 2.0) * 0.9
+            if close_lock:
+                target_x = self.ball_x
+                target_y = self.ball_y
+            elif random.random() < 0.3:
+                dx = self.agent_x - self.ball_x
+                dy = self.agent_y - self.ball_y
+                mag = math.hypot(dx, dy) or 1.0
+                target_x += (dx / mag) * 40.0
+                target_y += (dy / mag) * 40.0
             if self.agent_x < target_x - 6:
                 self.agent_x += agent_speed
             elif self.agent_x > target_x + 6:
@@ -1275,8 +1442,30 @@ class Game:
             self.agent_x = max(0, min(WIDTH, self.agent_x))
             self.agent_y = max(HEIGHT // 2, min(HEIGHT - 10, self.agent_y))
 
-        # AI 射擊：需在「AI 準心圖片區域」內才會引爆；若太靠近人類則會造成友火干擾
+        ball_caught = False
         if self.agent_active() and ai_active:
+            if getattr(self, "ai_cross_img", None):
+                ai_img_radius = self.ai_cross_img.get_width() / 2.0
+            else:
+                ai_img_radius = getattr(self, "explosion_radius", 48)
+            if dist_agent_to_ball <= ai_img_radius * 0.75:
+                if self.agent_close_shot_time is None:
+                    self.agent_close_shot_time = now + random.uniform(0.2, 0.4)
+                    self.agent_close_shot_due = now
+                if now >= self.agent_close_shot_time:
+                    self.round_ball_catch = getattr(self, "round_ball_catch", 0) + 1
+                    self.log_event("ball_catch", triggered_by="agent")
+                    self.create_explosion(self.agent_x, self.agent_y, "agent", now)
+                    self.last_ai_shot = now
+                    self.agent_close_shot_time = None
+                    self.agent_close_shot_due = None
+                    ball_caught = True
+            else:
+                self.agent_close_shot_time = None
+                self.agent_close_shot_due = None
+
+        # AI 射擊：需在「AI 準心圖片區域」內才會引爆；若太靠近人類則會造成友火干擾
+        if self.agent_active() and ai_active and not ball_caught:
             # 用 AI 圖片半徑做為可發射判定（若沒有圖片退回 explosion_radius）
             if getattr(self, "ai_cross_img", None):
                 ai_img_radius = self.ai_cross_img.get_width() / 2.0
@@ -1284,12 +1473,16 @@ class Game:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
             if dist_agent_to_ball <= ai_img_radius:
                 if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
-                    if aggressive:
+                    if aggressive_boost and self.agent_speed_mode == "C":
+                        shot_chance = 0.95
+                    elif aggressive and self.agent_speed_mode == "B":
                         shot_chance = 0.85
+                    elif aggressive:
+                        shot_chance = 0.95
                     elif passive:
-                        shot_chance = 0.65
+                        shot_chance = 0.75
                     else:
-                        shot_chance = 0.8
+                        shot_chance = 0.9
                     if random.random() <= shot_chance:
                         self.create_explosion(self.agent_x, self.agent_y, "agent", now)
                         self.last_ai_shot = now
@@ -1392,18 +1585,20 @@ class Game:
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
             visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
             if owner == "human":
-                dist_to_agent = math.hypot(self.agent_x - x, self.agent_y - y)
-                if dist_to_agent <= visual_r:
-                    # 友軍誤傷：閃頻並暫停
-                    self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
-                    self.ai_flash_ms = max(getattr(self, "ai_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
-                    self.log_event("friendly_fire", triggered_by="human")
+                if self.agent_active():
+                    dist_to_agent = math.hypot(self.agent_x - x, self.agent_y - y)
+                    if dist_to_agent <= visual_r:
+                        # 友軍誤傷：閃頻並暫停
+                        self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
+                        self.ai_flash_ms = max(getattr(self, "ai_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
+                        self.log_event("friendly_fire", triggered_by="human")
             elif owner == "agent":
-                dist_to_human = math.hypot(self.human_x - x, self.human_y - y)
-                if dist_to_human <= visual_r:
-                    self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
-                    self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
-                    self.log_event("friendly_fire", triggered_by="agent")
+                if self.human_active():
+                    dist_to_human = math.hypot(self.human_x - x, self.human_y - y)
+                    if dist_to_human <= visual_r:
+                        self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
+                        self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
+                        self.log_event("friendly_fire", triggered_by="agent")
         except AttributeError:
             # 若目前沒有 ball_x/ball_y，安全忽略
             pass
@@ -1504,7 +1699,13 @@ class Game:
     # --- 繪圖 ---
 
     def draw(self):
-        self.screen.fill(BG_COLOR)
+        if self.state in (GameState.ROUND, GameState.BREAK):
+            if self.current_round == 1:
+                self.screen.fill(PRACTICE_BG_COLOR)
+            else:
+                self.screen.fill(EXPERIMENT_BG_COLOR)
+        else:
+            self.screen.fill(BG_COLOR)
 
         if self.state == GameState.HOME:
             self.draw_home()
@@ -1517,6 +1718,8 @@ class Game:
 
         if getattr(self, "show_intro", False):
             self.intro_overlay.draw(self.screen, self.font_small, WIDTH, HEIGHT)
+        elif getattr(self, "pause_overlay_active", False):
+            self.draw_pause_overlay()
         elif getattr(self, "countdown_active", False):
             self.draw_countdown()
 
@@ -1530,15 +1733,52 @@ class Game:
         # 標題
         draw_text(self.screen, "Collaboration Game", self.font_large, WHITE, (WIDTH // 2, 150), center=True)
 
-        # 簡短說明
-        draw_text(
-            self.screen,
-            "This experiment uses default settings. Press START or ENTER to begin.",
-            self.font_medium,
-            LIGHT_GRAY,
-            (WIDTH // 2, 240),
-            center=True,
+        # # 簡短說明
+        # draw_text(
+        #     self.screen,
+        #     "This experiment uses default settings.",
+        #     self.font_medium,
+        #     LIGHT_GRAY,
+        #     (WIDTH // 2, 240),
+        #     center=True,
+        # )
+
+        # User ID 輸入框
+        self.user_id_rect = pg.Rect(0, 0, 260, 36)
+        self.user_id_rect.center = (WIDTH // 2, 300)
+        pg.draw.rect(self.screen, (40, 40, 55), self.user_id_rect, border_radius=6)
+        pg.draw.rect(self.screen, (140, 140, 160), self.user_id_rect, 1, border_radius=6)
+        uid_label = "User ID"
+        label_surf = self.font_tiny.render(uid_label, True, LIGHT_GRAY)
+        label_rect = label_surf.get_rect()
+        label_rect.midright = (self.user_id_rect.left - 12, self.user_id_rect.centery)
+        self.screen.blit(label_surf, label_rect)
+        uid_text = self.user_id_text if self.user_id_text else "Enter ID"
+        uid_color = WHITE if self.user_id_text else LIGHT_GRAY
+        uid_surf = self.font_small.render(uid_text, True, uid_color)
+        uid_rect = uid_surf.get_rect()
+        uid_rect.midleft = (self.user_id_rect.left + 10, self.user_id_rect.centery)
+        self.screen.blit(uid_surf, uid_rect)
+
+        # Mode/Signal/Agent（居中，放在輸入框下方）
+        gap = 20
+        total_w = (
+            self.mode_selector.rect.width
+            + gap
+            + self.signal_selector.rect.width
+            + gap
+            + self.agent_speed_selector.rect.width
         )
+        start_x = WIDTH // 2 - total_w // 2
+        y = 360
+        self.mode_selector.set_position(start_x, y)
+        self.signal_selector.set_position(start_x + self.mode_selector.rect.width + gap, y)
+        self.agent_speed_selector.set_position(
+            self.signal_selector.rect.right + gap, y
+        )
+        self.mode_selector.draw(self.screen, GRAY, WHITE)
+        self.signal_selector.draw(self.screen, GRAY, WHITE)
+        self.agent_speed_selector.draw(self.screen, GRAY, WHITE)
 
         # Start 按鈕
         self.start_button_rect = pg.Rect(WIDTH // 2 - 130, 540, 260, 60)
@@ -1561,6 +1801,13 @@ class Game:
         if WIDTH < 2 or HEIGHT < 2:
             return
 
+        # 回合中固定左上角
+        self.mode_selector.set_position(12, 10)
+        self.signal_selector.set_position(self.mode_selector.rect.right + 12, 10)
+        self.agent_speed_selector.set_position(self.signal_selector.rect.right + 12, 10)
+        self.info_button_rect.topright = (WIDTH - 12, 10)
+        self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
+
         # 畫可移動範圍分界線（位於畫面高度的一半）
         line_y = HEIGHT // 2
         # 半透明橫線
@@ -1571,8 +1818,11 @@ class Game:
         self.mode_selector.draw(self.screen, GRAY, WHITE)
         # 訊號下拉選單（模式旁）
         self.signal_selector.draw(self.screen, GRAY, WHITE)
+        # Agent speed 下拉選單（訊號旁）
+        self.agent_speed_selector.draw(self.screen, GRAY, WHITE)
         # 右上角資訊按鈕
         self.draw_info_button()
+        self.draw_pause_button()
         # 上方麥克風狀態
         self.draw_mic_status()
         # 畫下落目標
@@ -1634,24 +1884,33 @@ class Game:
                 pg.draw.circle(surf, (255, 120, 120, alpha), (radius, radius), radius)
                 self.screen.blit(surf, (fx - radius, fy - radius))
 
-        # 右上角顯示實驗統計：衝突次數 / 得分 / 失誤（使用回合內變數）
-        stats_text = f"Conflicts: {self.round_collisions}   Score: {self.round_score}   Errors: {self.round_errors}"
-        stats_surf = self.font_small.render(stats_text, True, WHITE)
-        stats_right = WIDTH - 20
-        if self.info_button_rect:
-            stats_right = min(stats_right, self.info_button_rect.left - 12)
-        stats_y = self.mode_selector.rect.top + (self.mode_selector.rect.height - stats_surf.get_height()) // 2
-        self.screen.blit(stats_surf, (stats_right - stats_surf.get_width(), stats_y))
+        # 右下角顯示實驗統計：Score / Conflicts / Errors
+        stats_text = f"Score:+{self.round_score} | Conflicts:-{self.round_collisions} | Errors:-{self.round_errors}"
+        stats_surf = self.font_small.render(stats_text, True, LIGHT_GRAY)
 
         # 左下角顯示 round（移除 condition）
-        info_text = f"User: {self.current_user_id} | Round {self.current_round}/{self.total_rounds}"
-        draw_text(self.screen, info_text, self.font_small, LIGHT_GRAY, (20, HEIGHT - 30))
+        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
+        remaining_ms = max(0, round_duration_ms - self.get_elapsed_ms())
+        remaining_sec = int(math.ceil(remaining_ms / 1000))
+        if self.current_round == 1:
+            round_label = "Practice"
+        else:
+            round_label = f"ROUND:{self.current_round - 1}/{self.total_rounds - 1}"
+        info_text = (
+            f"User: {self.current_user_id} | {round_label} | "
+            f"Time: {remaining_sec}s"
+        )
+        info_pos = (20, HEIGHT - 30)
+        draw_text(self.screen, info_text, self.font_small, LIGHT_GRAY, info_pos)
+        stats_pos = (WIDTH - 20 - stats_surf.get_width(), info_pos[1])
+        self.screen.blit(stats_surf, stats_pos)
 
     def draw_break(self):
         # 回合結果畫面
+        round_label = "Practice" if self.current_round == 1 else f"Round {self.current_round-1}"
         draw_text(
             self.screen,
-            f"Round {self.current_round} completed",
+            f" {round_label} completed",
             self.font_large,
             WHITE,
             (WIDTH // 2, HEIGHT // 2 - 60),
@@ -1659,7 +1918,7 @@ class Game:
         )
         draw_text(
             self.screen,
-            f"Score: {self.round_score}   Errors: {self.round_errors}",
+            f"Score: {self.round_score}   Conflicts: {self.round_collisions}   Errors: {self.round_errors}",
             self.font_medium,
             WHITE,
             (WIDTH // 2, HEIGHT // 2),
@@ -1667,11 +1926,11 @@ class Game:
         )
 
         if self.current_round < self.total_rounds:
-            msg = "Press SPACE or click below to start next round"
-            btn_text = "[ Next Round ]"
+            msg = "Select an action to continue"
+            btn_text = "Next Round"
         else:
-            msg = "All rounds completed. Press SPACE or click below to see summary"
-            btn_text = "[ Finish ]"
+            msg = "All rounds completed."
+            btn_text = "Finish"
 
         draw_text(
             self.screen,
@@ -1682,22 +1941,49 @@ class Game:
             center=True,
         )
 
-        # 中間當作「按鈕」的區域
-        center_rect = pg.Rect(0, 0, 400, 60)
-        center_rect.center = (WIDTH // 2, HEIGHT // 2 + 80)
-        pg.draw.rect(self.screen, GRAY, center_rect, border_radius=8)
+        # 操作按鈕
+        btn_w = 200
+        btn_h = 52
+        gap = 18
+        total_w = btn_w * 3 + gap * 2
+        start_x = WIDTH // 2 - total_w // 2
+        y = HEIGHT // 2 + 90
+        self.break_home_rect = pg.Rect(start_x, y, btn_w, btn_h)
+        self.break_restart_rect = pg.Rect(start_x + btn_w + gap, y, btn_w, btn_h)
+        self.break_next_rect = pg.Rect(start_x + (btn_w + gap) * 2, y, btn_w, btn_h)
+
+        pg.draw.rect(self.screen, GRAY, self.break_home_rect, border_radius=8)
+        pg.draw.rect(self.screen, GRAY, self.break_restart_rect, border_radius=8)
+        pg.draw.rect(self.screen, GRAY, self.break_next_rect, border_radius=8)
+        
+        draw_text(
+            self.screen,
+            "Home",
+            self.font_medium,
+            WHITE,
+            self.break_home_rect.center,
+            center=True,
+        )
+        draw_text(
+            self.screen,
+            "Restart",
+            self.font_medium,
+            WHITE,
+            self.break_restart_rect.center,
+            center=True,
+        )
         draw_text(
             self.screen,
             btn_text,
             self.font_medium,
             WHITE,
-            center_rect.center,
+            self.break_next_rect.center,
             center=True,
         )
 
         draw_text(
             self.screen,
-            "Press H to go Home",
+            "Press SPACE for Next | R to Restart | H to Home",
             self.font_small,
             LIGHT_GRAY,
             (WIDTH // 2, HEIGHT - 60),
@@ -1758,6 +2044,44 @@ class Game:
         icon_rect = icon_text.get_rect(center=rect.center)
         self.screen.blit(icon_text, icon_rect)
         self.screen.blit(icon_text, icon_rect.move(1, 0))
+
+    def draw_pause_button(self):
+        rect = self.pause_button_rect
+        pg.draw.circle(self.screen, (240, 240, 240), rect.center, rect.width // 2)
+        pg.draw.circle(self.screen, (150, 150, 150), rect.center, rect.width // 2, 1)
+        cx, cy = rect.center
+        pg.draw.line(self.screen, (60, 60, 60), (cx - 5, cy - 6), (cx - 5, cy + 6), 2)
+        pg.draw.line(self.screen, (60, 60, 60), (cx + 5, cy - 6), (cx + 5, cy + 6), 2)
+
+    def draw_pause_overlay(self):
+        overlay = pg.Surface((WIDTH, HEIGHT), flags=pg.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.screen.blit(overlay, (0, 0))
+        panel = pg.Rect(0, 0, 420, 260)
+        panel.center = (WIDTH // 2, HEIGHT // 2)
+        shadow = panel.move(4, 4)
+        pg.draw.rect(self.screen, (20, 20, 28), shadow, border_radius=12)
+        pg.draw.rect(self.screen, (245, 245, 245), panel, border_radius=12)
+
+        draw_text(self.screen, "Paused", self.font_large, (40, 40, 50), (panel.centerx, panel.top + 50), center=True)
+
+        btn_w = 220
+        btn_h = 46
+        gap = 14
+        start_y = panel.top + 90
+        self.pause_continue_rect = pg.Rect(0, 0, btn_w, btn_h)
+        self.pause_continue_rect.center = (panel.centerx, start_y)
+        self.pause_restart_rect = pg.Rect(0, 0, btn_w, btn_h)
+        self.pause_restart_rect.center = (panel.centerx, start_y + btn_h + gap)
+        self.pause_home_rect = pg.Rect(0, 0, btn_w, btn_h)
+        self.pause_home_rect.center = (panel.centerx, start_y + (btn_h + gap) * 2)
+
+        pg.draw.rect(self.screen, GRAY, self.pause_continue_rect, border_radius=8)
+        pg.draw.rect(self.screen, GRAY, self.pause_restart_rect, border_radius=8)
+        pg.draw.rect(self.screen, GRAY, self.pause_home_rect, border_radius=8)
+        draw_text(self.screen, "Continue", self.font_medium, WHITE, self.pause_continue_rect.center, center=True)
+        draw_text(self.screen, "Restart Round", self.font_medium, WHITE, self.pause_restart_rect.center, center=True)
+        draw_text(self.screen, "Home", self.font_medium, WHITE, self.pause_home_rect.center, center=True)
 
     def draw_mic_status(self):
         active = False
