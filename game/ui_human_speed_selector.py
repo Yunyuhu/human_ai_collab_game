@@ -1,7 +1,7 @@
 import pygame as pg
 
 
-class AgentSpeedSelector:
+class HumanSpeedSelector:
     def __init__(self, rect, font, options, initial_key):
         self.rect = pg.Rect(rect)
         self.font = font
@@ -38,7 +38,7 @@ class AgentSpeedSelector:
         pg.draw.rect(surface, bg_color, self.rect, border_radius=self.border_radius)
         pg.draw.rect(surface, (200, 200, 200), self.rect, self.border_width, border_radius=self.border_radius)
         label = self.options[self.selected]
-        text_surf = self.font.render(f"AGENT: {label}", True, text_color)
+        text_surf = self.font.render(f"HUMAN SPEED: {label}", True, text_color)
         text_rect = text_surf.get_rect()
         text_rect.midleft = (self.rect.x + 10, self.rect.centery)
         max_right = self.rect.right - 22

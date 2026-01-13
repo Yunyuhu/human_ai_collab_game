@@ -13,7 +13,7 @@ import api_client
 from audio import AudioManager
 from ui_mode_selector import ModeSelector
 from ui_signal_selector import SignalSelector
-from ui_agent_speed_selector import AgentSpeedSelector
+from ui_human_speed_selector import HumanSpeedSelector
 from voice_signal import VoiceSignalListener
 from ui_intro_overlay import IntroOverlay
 
@@ -34,10 +34,11 @@ EXPERIMENT_BG_COLOR = (10, 30, 80)
 
 # 遊戲設定
 ROUND_DURATION_MS = 120_000  # 每回合 120 秒
-TOTAL_ROUNDS = 4
+TOTAL_ROUNDS = 3
 
 PADDLE_W, PADDLE_H = 100, 20
 BALL_R = 10
+DIVIDER_Y_RATIO = 0.35
 
 # 新增協作 / 友火相關參數
 SHOOT_RANGE = 120                 # 保留備用（不直接用於內圈判定）
@@ -222,6 +223,7 @@ class Game:
         self.countdown_end_time = 0.0
         self.countdown_start_ms = None
         self.info_pause_start_ms = None
+        self.pause_start_ms = None
         self.restart_pending = False
         self.human_icon_until = 0.0
         self.joystick_axes = []
@@ -242,11 +244,14 @@ class Game:
         # 實驗與回合資料
         self.current_user_id = None      # 真的開始實驗後才設定
         self.condition_code = None       # 1~4
-        self.signal_mode = "negotiation"
+        self.signal_mode = "no_signal"
         self.current_round = 0
         self.total_rounds = TOTAL_ROUNDS
         self.exp_start_iso: Optional[str] = None
         self.exp_logged = False
+        self.allow_info_overlay = True
+        self.session_id: Optional[str] = None
+        self.completed_speeds: set[str] = set()
 
         # 回合內的統計
         self.round_score = 0
@@ -274,7 +279,7 @@ class Game:
             "human_only": "HUMAN ONLY",
             "both": "BOTH",
         }
-        self.control_mode = "both"
+        self.control_mode = "human_only"
         self.mode_selector = ModeSelector(
             rect=pg.Rect(12, 10, 250, 28),
             font=self.font_tiny,
@@ -282,12 +287,11 @@ class Game:
             initial_key=self.control_mode,
         )
         self.agent_speed_options = {
-            "A": "A mode",
-            "B": "B mode",
-            "C": "C mode",
+            "A": "A",
+            "B": "B",
         }
         self.agent_speed_mode = "A"
-        self.agent_speed_selector = AgentSpeedSelector(
+        self.agent_speed_selector = HumanSpeedSelector(
             rect=pg.Rect(0, 0, 250, 28),
             font=self.font_tiny,
             options=self.agent_speed_options,
@@ -401,9 +405,59 @@ class Game:
             self.round_start_iso = None
         self.reset_round_objects()
         self.conflict_flash_ms = 0
+        self.overlap_active = False
+        self.overlap_start_iso = None
         self.break_next_rect = None
         self.break_restart_rect = None
         self.break_home_rect = None
+        self.overlap_active = False
+        self.overlap_start_iso = None
+
+    def level_name_for_round(self, round_id: int) -> str:
+        return f"level{max(1, round_id)}"
+
+    def current_level_name(self) -> str:
+        return self.level_name_for_round(self.current_round)
+
+    def has_any_speed_session_local(self, user_id: int) -> bool:
+        data_dir = self.base_dir.parent / "data" / f"user_{user_id}"
+        for speed in ("A", "B"):
+            condition_dir = data_dir / f"condition_{speed}"
+            if any(p.is_dir() for p in condition_dir.glob("session_*")):
+                return True
+        return False
+
+    def next_speed_condition(self) -> Optional[str]:
+        if "A" in self.completed_speeds and "B" not in self.completed_speeds:
+            return "B"
+        if "B" in self.completed_speeds and "A" not in self.completed_speeds:
+            return "A"
+        return None
+
+    def start_next_speed_run(self, next_speed: str) -> None:
+        self.agent_speed_mode = next_speed
+        if getattr(self, "agent_speed_selector", None):
+            self.agent_speed_selector.selected = next_speed
+        self.condition_code = CONDITION_BY_MODE.get(self.signal_mode, 1)
+        self.current_round = 1
+        self.total_score = 0
+        self.total_errors = 0
+        self.reset_round_stats(start_timer=False)
+        self.start_experiment_api()
+        self.pending_start = True
+        self.state = GameState.ROUND
+        user_id = self.current_user_id or 0
+        has_any_backend = api_client.has_any_speed_session(user_id)
+        has_any_local = self.has_any_speed_session_local(user_id)
+        self.allow_info_overlay = not (has_any_backend or has_any_local)
+        if self.allow_info_overlay:
+            self.begin_info_pause()
+            self.configure_intro_images()
+            self.intro_overlay.index = 0
+            self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+            self.show_intro = True
+        else:
+            self.start_countdown(3)
 
     def get_elapsed_ms(self):
         """回傳本回合已經過的毫秒數（扣掉暫停時間）"""
@@ -437,7 +491,7 @@ class Game:
                 self.detach_joystick(event.instance_id)
             if getattr(self, "show_intro", False):
                 result = self.intro_overlay.handle_event(event)
-                if result == "close":
+                if result == "start":
                     self.show_intro = False
                     self.end_info_pause()
                     if self.pending_start or self.state == GameState.ROUND:
@@ -479,9 +533,14 @@ class Game:
                     return
                 self.try_start_experiment()
                 self.pending_start = True
-                self.begin_info_pause()
-                self.intro_overlay.index = 0
-                self.show_intro = True
+                if self.allow_info_overlay:
+                    self.begin_info_pause()
+                    self.configure_intro_images()
+                    self.intro_overlay.index = 0
+                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.show_intro = True
+                else:
+                    self.start_countdown(3)
             if self.user_id_rect.collidepoint(event.pos):
                 self.user_id_active = True
             else:
@@ -500,18 +559,28 @@ class Game:
                     return
                 self.try_start_experiment()
                 self.pending_start = True
-                self.begin_info_pause()
-                self.intro_overlay.index = 0
-                self.show_intro = True
+                if self.allow_info_overlay:
+                    self.begin_info_pause()
+                    self.configure_intro_images()
+                    self.intro_overlay.index = 0
+                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.show_intro = True
+                else:
+                    self.start_countdown(3)
         if event.type == pg.JOYBUTTONDOWN:
             if event.button == 0:
                 if not self.user_id_text.strip():
                     return
                 self.try_start_experiment()
                 self.pending_start = True
-                self.begin_info_pause()
-                self.intro_overlay.index = 0
-                self.show_intro = True
+                if self.allow_info_overlay:
+                    self.begin_info_pause()
+                    self.configure_intro_images()
+                    self.intro_overlay.index = 0
+                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.show_intro = True
+                else:
+                    self.start_countdown(3)
 
     def handle_resize(self, event):
         """視窗縮放時重新取得尺寸，讓 UI 保持置中。"""
@@ -553,6 +622,25 @@ class Game:
             debug=True,
         )
         self.voice_listener.start()
+
+    def configure_intro_images(self):
+        if not self.intro_overlay:
+            return
+        if self.control_mode == "human_only":
+            images = [
+                self.base_dir / "source" / "pilot_info1.png",
+                self.base_dir / "source" / "pilot_info2.png",
+                self.base_dir / "source" / "game_info3.png",
+                self.base_dir / "source" / "game_info4.png",
+            ]
+        else:
+            images = [
+                self.base_dir / "source" / "game_info1.png",
+                self.base_dir / "source" / "game_info2.png",
+                self.base_dir / "source" / "game_info3.png",
+                self.base_dir / "source" / "game_info4.png",
+            ]
+        self.intro_overlay.set_images(images)
 
     def attach_first_joystick(self):
         if pg.joystick.get_count() <= 0:
@@ -645,6 +733,27 @@ class Game:
     def agent_signal_allowed(self):
         return self.signal_mode in ("agent_dom", "negotiation")
 
+    def is_target_overlap(self) -> bool:
+        if not self.human_active():
+            return False
+        if getattr(self, "human_cross_img", None):
+            img_radius = self.human_cross_img.get_width() / 2.0
+        else:
+            img_radius = getattr(self, "explosion_radius", 48)
+        dist_to_ball = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
+        return dist_to_ball <= img_radius * 1.1
+
+    def update_overlap_state(self) -> None:
+        overlap_now = self.is_target_overlap()
+        if overlap_now and not getattr(self, "overlap_active", False):
+            self.overlap_active = True
+            self.overlap_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+            self.log_event("overlap_start", triggered_by="system")
+        elif not overlap_now and getattr(self, "overlap_active", False):
+            self.overlap_active = False
+            self.log_event("overlap_end", triggered_by="system")
+            self.overlap_start_iso = None
+
     def start_countdown(self, seconds: int = 3):
         self.countdown_active = True
         self.countdown_end_time = time.time() + max(1, seconds)
@@ -660,6 +769,17 @@ class Game:
                 paused_ms = pg.time.get_ticks() - self.info_pause_start_ms
                 self.round_start_ms += paused_ms
             self.info_pause_start_ms = None
+
+    def begin_pause_timer(self):
+        if self.state == GameState.ROUND and self.pause_start_ms is None:
+            self.pause_start_ms = pg.time.get_ticks()
+
+    def end_pause_timer(self):
+        if self.state == GameState.ROUND and self.pause_start_ms is not None:
+            if self.round_start_ms is not None:
+                paused_ms = pg.time.get_ticks() - self.pause_start_ms
+                self.round_start_ms += paused_ms
+            self.pause_start_ms = None
 
     def update_trigger_icons(self, now: float) -> None:
         if not self.human_signal_allowed():
@@ -877,10 +997,34 @@ class Game:
         # 只有當 ball 進入準心圖片區域才允許開火
         dist_to_ball = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
         if dist_to_ball <= img_radius * 1.1:
+            if not getattr(self, "overlap_active", False):
+                self.overlap_active = True
+                self.overlap_start_iso = dt.datetime.utcnow().isoformat() + "Z"
+                self.log_event("overlap_start", triggered_by="system")
+            last_shot = getattr(self, "last_human_shot", 0.0)
+            shot_interval = (now - last_shot) if last_shot else None
+            overlap_crosshair = False
+            if self.agent_active():
+                cross_dist = math.hypot(self.human_x - self.agent_x, self.human_y - self.agent_y)
+                overlap_crosshair = cross_dist < (PADDLE_W * 0.8)
             # 建立爆炸（實際命中仍由 create_explosion 判定 inner 1/3）
-            self.create_explosion(self.human_x, self.human_y, "human", now)
+            hit, shot_distance, inner_radius = self.create_explosion(self.human_x, self.human_y, "human", now)
             self.last_human_shot = now
-            # 若另一方太靠近則會誤傷 -> 施加干擾
+            self.log_event(
+                "shot",
+                triggered_by="human",
+                shot_hit=hit,
+                shot_interval=shot_interval,
+                shot_distance=shot_distance,
+                shot_inner_radius=inner_radius,
+                overlap_crosshair=overlap_crosshair,
+            )
+            if hit:
+                self.log_event("success", triggered_by="human")
+            else:
+                self.log_event("miss", triggered_by="human")
+        # 若另一方太靠近則會誤傷 -> 施加干擾
+        if self.agent_active():
             dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
             if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
                 # 友軍在爆炸預估視覺範圍內，施加誤傷效果（閃頻 + 暫停）
@@ -936,6 +1080,12 @@ class Game:
             self.current_user_id = int(self.user_id_text)
         else:
             self.current_user_id = 0
+        has_any_backend = api_client.has_any_speed_session(self.current_user_id)
+        has_any_local = self.has_any_speed_session_local(self.current_user_id)
+        self.allow_info_overlay = not (has_any_backend or has_any_local)
+        if self.session_id is None:
+            self.session_id = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            self.completed_speeds = set()
         self.condition_code = CONDITION_BY_MODE.get(self.signal_mode, 1)
         self.current_round = 1
         # 重置總成績
@@ -1009,9 +1159,18 @@ class Game:
         triggered_by: str = "system",
         signal_type: str = "NA",
         dir_ratio: Optional[float] = None,
+        shot_hit: Optional[bool] = None,
+        shot_interval: Optional[float] = None,
+        shot_distance: Optional[float] = None,
+        shot_inner_radius: Optional[float] = None,
+        overlap_crosshair: Optional[bool] = None,
     ) -> None:
         if self.current_user_id is None or self.condition_code is None or self.current_round is None:
             return
+        extra_payload = {}
+        if isinstance(event_type, dict):
+            extra_payload = dict(event_type)
+            event_type = extra_payload.pop("type", "custom")
         speed = math.sqrt(self.ball_vx ** 2 + self.ball_vy ** 2)
         angle = math.degrees(math.atan2(self.ball_vy, self.ball_vx))
         payload = {
@@ -1031,7 +1190,17 @@ class Game:
             "dir_ratio": dir_ratio,
             "ball_speed": round(speed, 3),
             "ball_angle": round(angle, 3),
+            "session_id": self.session_id,
+            "speed_condition": self.agent_speed_mode,
+            "level_name": self.current_level_name(),
+            "shot_hit": shot_hit,
+            "shot_interval": shot_interval,
+            "shot_distance": shot_distance,
+            "shot_inner_radius": shot_inner_radius,
+            "overlap_crosshair": overlap_crosshair,
         }
+        if extra_payload:
+            payload.update(extra_payload)
         api_client.log_event(payload)
 
     def start_experiment_api(self):
@@ -1045,6 +1214,8 @@ class Game:
             self.total_rounds,
             notes="",
             exp_start_time=self.exp_start_iso,
+            session_id=self.session_id,
+            speed_condition=self.agent_speed_mode,
         )
 
     def end_experiment_api(self):
@@ -1058,8 +1229,11 @@ class Game:
             exp_end,
             self.total_rounds,
             notes="",
+            session_id=self.session_id,
+            speed_condition=self.agent_speed_mode,
         )
         self.exp_logged = True
+        self.completed_speeds.add(self.agent_speed_mode)
 
     def start_round_api(self):
         if self.current_user_id is None or self.condition_code is None or self.round_start_iso is None:
@@ -1072,6 +1246,9 @@ class Game:
             agent_active,
             human_active,
             self.round_start_iso,
+            session_id=self.session_id,
+            speed_condition=self.agent_speed_mode,
+            level_name=self.current_level_name(),
         )
 
     def end_round_api(self):
@@ -1094,6 +1271,9 @@ class Game:
             self.round_ball_miss,
             agent_active,
             human_active,
+            session_id=self.session_id,
+            speed_condition=self.agent_speed_mode,
+            level_name=self.current_level_name(),
         )
 
     def handle_events_round(self, event):
@@ -1108,12 +1288,15 @@ class Game:
             if self.agent_speed_selector.handle_event(event):
                 self.agent_speed_mode = self.agent_speed_selector.selected
                 return
-            if self.info_button_rect.collidepoint(event.pos):
+            if self.allow_info_overlay and self.info_button_rect.collidepoint(event.pos):
                 self.begin_info_pause()
+                self.configure_intro_images()
                 self.intro_overlay.index = 0
+                self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
                 self.show_intro = True
                 return
             if self.pause_button_rect.collidepoint(event.pos):
+                self.begin_pause_timer()
                 self.pause_overlay_active = True
                 return
             mic_center = (WIDTH // 2, 18)
@@ -1125,6 +1308,7 @@ class Game:
             if event.key == pg.K_ESCAPE:
                 self.go_home()
             if event.key == pg.K_p:
+                self.begin_pause_timer()
                 self.pause_overlay_active = True
 
             # 人類按空白鍵發射（只有當目標進入準心圖片區域才可發射）
@@ -1173,23 +1357,32 @@ class Game:
 
     def handle_events_done(self, event):
         if event.type == pg.KEYDOWN:
+            if event.key == pg.K_SPACE:
+                next_speed = self.next_speed_condition()
+                if next_speed:
+                    self.start_next_speed_run(next_speed)
+                    return
             if event.key == pg.K_h:
                 self.go_home()
 
     def handle_events_pause(self, event):
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_ESCAPE:
+                self.end_pause_timer()
                 self.pause_overlay_active = False
                 return
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             if self.pause_continue_rect and self.pause_continue_rect.collidepoint(event.pos):
+                self.end_pause_timer()
                 self.pause_overlay_active = False
                 return
             if self.pause_restart_rect and self.pause_restart_rect.collidepoint(event.pos):
+                self.end_pause_timer()
                 self.pause_overlay_active = False
                 self.restart_round()
                 return
             if self.pause_home_rect and self.pause_home_rect.collidepoint(event.pos):
+                self.end_pause_timer()
                 self.pause_overlay_active = False
                 self.go_home()
                 return
@@ -1209,6 +1402,8 @@ class Game:
         self.round_start_ms = None
         self.total_score = 0
         self.total_errors = 0
+        self.session_id = None
+        self.completed_speeds = set()
         print("Return to HOME")
 
     def go_next_round_or_done(self):
@@ -1279,7 +1474,7 @@ class Game:
             return
         if getattr(self, "countdown_active", False):
             return
-        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
+        round_duration_ms = ROUND_DURATION_MS
         if self.get_elapsed_ms() >= round_duration_ms:
             self.finish_round()
             self.state = GameState.BREAK
@@ -1305,7 +1500,12 @@ class Game:
         now = time.time()
         human_penalty_active = now < getattr(self, "human_penalty_until", 0.0)
         ai_penalty_active = now < getattr(self, "ai_penalty_until", 0.0)
-        human_speed = 2.4 * (0.4 if human_penalty_active else 1.0)
+        divider_y = int(HEIGHT * DIVIDER_Y_RATIO)
+        human_speed = 2.2
+        if self.agent_speed_mode == "B":
+            human_speed = 2.4
+        if human_penalty_active:
+            human_speed *= 0.4
         if self.human_active():
             if keys[pg.K_LEFT] or keys[pg.K_a]:
                 self.human_x -= human_speed
@@ -1333,7 +1533,7 @@ class Game:
             self.update_trigger_icons(now)
             self.process_voice_events(now)
             self.human_x = max(0, min(WIDTH, self.human_x))
-            self.human_y = max(HEIGHT // 2, min(HEIGHT - 10, self.human_y))
+            self.human_y = max(divider_y, min(HEIGHT - 10, self.human_y))
 
         # 目標下落
         self.ball_x += self.ball_vx
@@ -1349,6 +1549,8 @@ class Game:
         if self.ball_x > WIDTH - 20:
             self.ball_x = WIDTH - 20
             self.ball_vx = -abs(self.ball_vx) * 0.6
+
+        self.update_overlap_state()
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
@@ -1374,13 +1576,9 @@ class Game:
         aggressive = now < getattr(self, "ai_aggressive_until", 0.0) and now >= getattr(
             self, "human_my_block_until", 0.0
         )
-        if self.agent_speed_mode in ("B", "C") and now >= getattr(self, "human_my_block_until", 0.0):
+        if now >= getattr(self, "human_my_block_until", 0.0):
             aggressive = True
-        aggressive_boost = now < getattr(self, "ai_aggressive_boost_until", 0.0)
-        if self.agent_speed_mode == "B" and now >= getattr(self, "human_my_block_until", 0.0):
-            aggressive_boost = False
-        elif self.agent_speed_mode == "C" and now >= getattr(self, "human_my_block_until", 0.0):
-            aggressive_boost = True
+        aggressive_boost = False
         passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
@@ -1389,12 +1587,8 @@ class Game:
             agent_speed *= getattr(self, "ai_slow_factor", 0.5)
         else:
             self.ai_slow_factor = 1.0
-        if aggressive_boost and self.agent_speed_mode == "C":
-            agent_speed *= 1.4
-        elif aggressive and self.agent_speed_mode == "B":
+        if aggressive:
             agent_speed *= 1.15
-        elif aggressive:
-            agent_speed *= 1.25
         elif passive:
             agent_speed *= 0.85
         ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
@@ -1403,12 +1597,8 @@ class Game:
         if self.agent_active() and ai_active and ball_travel_progress >= 0.15:
             self.ai_aim_offset_x = getattr(self, "ai_aim_offset_x", 0.0)
             self.ai_aim_offset_y = getattr(self, "ai_aim_offset_y", 0.0)
-            if aggressive_boost and self.agent_speed_mode == "C":
-                jitter_scale = 0.45
-            elif aggressive and self.agent_speed_mode == "B":
+            if aggressive:
                 jitter_scale = 0.7
-            elif aggressive:
-                jitter_scale = 0.55
             elif passive:
                 jitter_scale = 1.1
             else:
@@ -1419,6 +1609,9 @@ class Game:
             self.ai_aim_offset_y = max(-18.0, min(18.0, self.ai_aim_offset_y))
             target_x = self.ball_x + self.ai_aim_offset_x
             target_y = self.ball_y + self.ai_aim_offset_y
+            min_agent_y = divider_y + 20
+            if target_y < min_agent_y:
+                target_y = min_agent_y
             close_lock = False
             if getattr(self, "ai_cross_img", None):
                 close_lock = dist_agent_to_ball <= (self.ai_cross_img.get_width() / 2.0) * 0.9
@@ -1440,7 +1633,7 @@ class Game:
             elif self.agent_y > target_y + 6:
                 self.agent_y -= agent_speed
             self.agent_x = max(0, min(WIDTH, self.agent_x))
-            self.agent_y = max(HEIGHT // 2, min(HEIGHT - 10, self.agent_y))
+            self.agent_y = max(min_agent_y, min(HEIGHT - 10, self.agent_y))
 
         ball_caught = False
         if self.agent_active() and ai_active:
@@ -1473,12 +1666,8 @@ class Game:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
             if dist_agent_to_ball <= ai_img_radius:
                 if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
-                    if aggressive_boost and self.agent_speed_mode == "C":
-                        shot_chance = 0.95
-                    elif aggressive and self.agent_speed_mode == "B":
+                    if aggressive:
                         shot_chance = 0.85
-                    elif aggressive:
-                        shot_chance = 0.95
                     elif passive:
                         shot_chance = 0.75
                     else:
@@ -1532,7 +1721,7 @@ class Game:
             self.reset_ball_random()
 
         # 檢查準心重疊（靠太近會造成被動干擾）
-        if self.human_active() and self.agent_active() and not getattr(self, "hide_mode_ui", False):
+        if self.control_mode == "both" and not getattr(self, "hide_mode_ui", False):
             cross_dist = math.hypot(self.human_x - self.agent_x, self.human_y - self.agent_y)
             overlap_thresh = PADDLE_W * 0.8
             if cross_dist < overlap_thresh:
@@ -1559,7 +1748,7 @@ class Game:
                     # 記錄事件（一次即可）
                     self.log_event("crosshair_overlap", triggered_by="system")
 
-    def create_explosion(self, x: float, y: float, owner: str, now: float) -> None:
+    def create_explosion(self, x: float, y: float, owner: str, now: float) -> tuple[bool, Optional[float], Optional[float]]:
         """在 (x,y) 產生短暫爆炸並立即檢查命中（不產生移動子彈）"""
         if not hasattr(self, "explosions"):
             self.explosions = []
@@ -1568,6 +1757,8 @@ class Game:
         self.explosions.append(exp)
         # 立即檢查是否命中當前目標（ball）
         hit = False
+        dist = None
+        hit_radius = None
         try:
             dist = math.hypot(self.ball_x - x, self.ball_y - y)
             # 命中條件：在爆炸半徑的 INNER_SHOOT_FACTOR（例如 1/3）內才算命中
@@ -1622,6 +1813,7 @@ class Game:
                     pass
         except Exception:
             pass
+        return hit, dist, hit_radius
 
     def apply_friendly_penalty(self, target: str, now: float, dur: float = FRIENDLY_FIRE_PENALTY_SEC) -> None:
         """
@@ -1809,7 +2001,7 @@ class Game:
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
 
         # 畫可移動範圍分界線（位於畫面高度的一半）
-        line_y = HEIGHT // 2
+        line_y = int(HEIGHT * DIVIDER_Y_RATIO)
         # 半透明橫線
         line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
         line_surf.fill((180, 180, 180, 140))
@@ -1818,7 +2010,7 @@ class Game:
         self.mode_selector.draw(self.screen, GRAY, WHITE)
         # 訊號下拉選單（模式旁）
         self.signal_selector.draw(self.screen, GRAY, WHITE)
-        # Agent speed 下拉選單（訊號旁）
+        # Human speed 下拉選單（訊號旁）
         self.agent_speed_selector.draw(self.screen, GRAY, WHITE)
         # 右上角資訊按鈕
         self.draw_info_button()
@@ -1884,18 +2076,15 @@ class Game:
                 pg.draw.circle(surf, (255, 120, 120, alpha), (radius, radius), radius)
                 self.screen.blit(surf, (fx - radius, fy - radius))
 
-        # 右下角顯示實驗統計：Score / Conflicts / Errors
-        stats_text = f"Score:+{self.round_score} | Conflicts:-{self.round_collisions} | Errors:-{self.round_errors}"
+        # 右下角顯示實驗統計：Score / Errors
+        stats_text = f"Score:+{self.round_score} | Errors:-{self.round_errors}"
         stats_surf = self.font_small.render(stats_text, True, LIGHT_GRAY)
 
         # 左下角顯示 round（移除 condition）
-        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
+        round_duration_ms = ROUND_DURATION_MS
         remaining_ms = max(0, round_duration_ms - self.get_elapsed_ms())
         remaining_sec = int(math.ceil(remaining_ms / 1000))
-        if self.current_round == 1:
-            round_label = "Practice"
-        else:
-            round_label = f"ROUND:{self.current_round - 1}/{self.total_rounds - 1}"
+        round_label = f"ROUND:{self.current_round}/{self.total_rounds}"
         info_text = (
             f"User: {self.current_user_id} | {round_label} | "
             f"Time: {remaining_sec}s"
@@ -1907,7 +2096,7 @@ class Game:
 
     def draw_break(self):
         # 回合結果畫面
-        round_label = "Practice" if self.current_round == 1 else f"Round {self.current_round-1}"
+        round_label = f"Round {self.current_round}"
         draw_text(
             self.screen,
             f" {round_label} completed",
@@ -1918,7 +2107,7 @@ class Game:
         )
         draw_text(
             self.screen,
-            f"Score: {self.round_score}   Conflicts: {self.round_collisions}   Errors: {self.round_errors}",
+            f"Score: {self.round_score}   Errors: {self.round_errors}",
             self.font_medium,
             WHITE,
             (WIDTH // 2, HEIGHT // 2),
@@ -1983,7 +2172,7 @@ class Game:
 
         draw_text(
             self.screen,
-            "Press SPACE for Next | R to Restart | H to Home",
+            "Press A to Home | Y to Restart | B for Next",
             self.font_small,
             LIGHT_GRAY,
             (WIDTH // 2, HEIGHT - 60),
@@ -1991,6 +2180,7 @@ class Game:
         )
 
     def draw_done(self):
+        next_speed = self.next_speed_condition()
         draw_text(
             self.screen,
             "Experiment Finished",
@@ -2018,12 +2208,21 @@ class Game:
 
         draw_text(
             self.screen,
-            "Press H to return Home",
+            f"Press SPACE to start Speed {next_speed}" if next_speed else "Press H to return Home",
             self.font_small,
             LIGHT_GRAY,
             (WIDTH // 2, HEIGHT // 2 + 80),
             center=True,
         )
+        if next_speed:
+            draw_text(
+                self.screen,
+                "Press H to return Home",
+                self.font_small,
+                LIGHT_GRAY,
+                (WIDTH // 2, HEIGHT // 2 + 120),
+                center=True,
+            )
 
     def draw_countdown(self):
         remaining = max(0, int(math.ceil(self.countdown_end_time - time.time())))

@@ -37,6 +37,7 @@ class IntroOverlay:
         self.practice_sound_loaded = False
         self.practice_signal_img = None
         self.practice_signal_until = 0.0
+        self.page_limit = None
 
     def set_practice_assets(self, cross_img, target_img):
         self.practice_cross_img = cross_img
@@ -48,6 +49,14 @@ class IntroOverlay:
         self.practice_signal_img_my = my_img
         self.practice_signal_img_left = left_img
         self.practice_signal_img_right = right_img
+
+    def set_images(self, image_paths):
+        self.images = []
+        for path in image_paths:
+            try:
+                self.images.append(pg.image.load(str(path)).convert_alpha())
+            except Exception:
+                self.images.append(None)
 
     def _ensure_practice_sound(self):
         if self.practice_sound_loaded:
@@ -78,7 +87,7 @@ class IntroOverlay:
     def handle_event(self, event):
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             if self.close_rect.collidepoint(event.pos):
-                return "close"
+                return None
             if self.prev_rect.collidepoint(event.pos):
                 self.prev()
                 return "nav"
@@ -106,7 +115,7 @@ class IntroOverlay:
                 self.next()
                 return "nav"
             if event.button in (6, 4):
-                return "close"
+                return "start"
             if event.button == 0:
                 self.practice_shoot()
                 return "practice"
@@ -120,7 +129,7 @@ class IntroOverlay:
             if event.axis in (2, 4):
                 if event.value > 0.6 and not self.lt_axis_latched:
                     self.lt_axis_latched = True
-                    return "close"
+                    return "start"
                 if event.value < 0.2:
                     self.lt_axis_latched = False
             if self.index == 3 and event.axis in (5, 3):
@@ -132,12 +141,26 @@ class IntroOverlay:
                     self.rt_axis_latched = False
         return None
 
+    def set_page_limit(self, limit):
+        if limit is not None and limit < 1:
+            limit = 1
+        self.page_limit = limit
+        total_pages = self._page_count()
+        if total_pages > 0 and self.index >= total_pages:
+            self.index = total_pages - 1
+
+    def _page_count(self):
+        total = len(self.images)
+        if self.page_limit is not None:
+            total = min(total, self.page_limit)
+        return total
+
     def prev(self):
         if self.index > 0:
             self.index -= 1
 
     def next(self):
-        if self.index < len(self.images) - 1:
+        if self.index < self._page_count() - 1:
             self.index += 1
 
     def update(self, dt, joystick, screen_w, screen_h):
@@ -262,7 +285,8 @@ class IntroOverlay:
         pg.draw.rect(surface, (20, 20, 28), shadow, border_radius=14)
         pg.draw.rect(surface, (245, 245, 245), self.panel_rect, border_radius=14)
 
-        img = self.images[self.index] if self.images else None
+        total_pages = self._page_count()
+        img = self.images[self.index] if self.images and self.index < total_pages else None
         if img:
             max_w = int(self.panel_rect.width * 0.90)
             max_h = int(self.panel_rect.height * 0.90)
@@ -337,16 +361,22 @@ class IntroOverlay:
         self.prev_rect = pg.Rect(self.panel_rect.left + 10, btn_y, 40, 40)
         self.next_rect = pg.Rect(self.panel_rect.right - 50, btn_y, 40, 40)
         self._draw_nav_button(surface, self.prev_rect, "<", enabled=self.index > 0)
-        self._draw_nav_button(surface, self.next_rect, ">", enabled=self.index < len(self.images) - 1)
+        self._draw_nav_button(surface, self.next_rect, ">", enabled=self.index < total_pages - 1)
 
         # Page indicator
-        if self.images:
-            page_text = f"{self.index + 1}/{len(self.images)}"
+        if total_pages > 0:
+            page_text = f"{self.index + 1}/{total_pages}"
             text_surf = font.render(page_text, True, (80, 80, 80))
             text_rect = text_surf.get_rect()
             text_rect.midbottom = (self.panel_rect.centerx, self.panel_rect.bottom - 12)
             surface.blit(text_surf, text_rect)
-            hint_text = "X: Prev   B: Next   LT: Start"
+            hint_parts = []
+            if self.index > 0:
+                hint_parts.append("X: Prev")
+            if self.index < total_pages - 1:
+                hint_parts.append("B: Next")
+            hint_parts.append("LT: Start")
+            hint_text = "   ".join(hint_parts)
             hint_surf = font.render(hint_text, True, (255, 255, 255))
             hint_rect = hint_surf.get_rect()
             hint_rect.midtop = (self.panel_rect.centerx, self.panel_rect.bottom + 6)
