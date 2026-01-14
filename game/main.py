@@ -454,7 +454,7 @@ class Game:
             self.begin_info_pause()
             self.configure_intro_images()
             self.intro_overlay.index = 0
-            self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+            self.apply_intro_page_limit()
             self.show_intro = True
         else:
             self.start_countdown(3)
@@ -537,7 +537,7 @@ class Game:
                     self.begin_info_pause()
                     self.configure_intro_images()
                     self.intro_overlay.index = 0
-                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.apply_intro_page_limit()
                     self.show_intro = True
                 else:
                     self.start_countdown(3)
@@ -563,7 +563,7 @@ class Game:
                     self.begin_info_pause()
                     self.configure_intro_images()
                     self.intro_overlay.index = 0
-                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.apply_intro_page_limit()
                     self.show_intro = True
                 else:
                     self.start_countdown(3)
@@ -577,7 +577,7 @@ class Game:
                     self.begin_info_pause()
                     self.configure_intro_images()
                     self.intro_overlay.index = 0
-                    self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                    self.apply_intro_page_limit()
                     self.show_intro = True
                 else:
                     self.start_countdown(3)
@@ -626,12 +626,16 @@ class Game:
     def configure_intro_images(self):
         if not self.intro_overlay:
             return
+        base_speed = 2.2
+        if self.agent_speed_mode == "B":
+            base_speed = 2.4
+        self.intro_overlay.set_practice_speed(base_speed * FPS * 0.9)
         if self.control_mode == "human_only":
             images = [
                 self.base_dir / "source" / "pilot_info1.png",
                 self.base_dir / "source" / "pilot_info2.png",
-                self.base_dir / "source" / "game_info3.png",
-                self.base_dir / "source" / "game_info4.png",
+                self.base_dir / "source" / "pilot_info3.png",
+                self.base_dir / "source" / "pilot_info4.png",
             ]
         else:
             images = [
@@ -641,6 +645,14 @@ class Game:
                 self.base_dir / "source" / "game_info4.png",
             ]
         self.intro_overlay.set_images(images)
+
+    def apply_intro_page_limit(self):
+        if not self.intro_overlay:
+            return
+        if self.control_mode == "human_only":
+            self.intro_overlay.set_page_limit(4)
+        else:
+            self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
 
     def attach_first_joystick(self):
         if pg.joystick.get_count() <= 0:
@@ -1288,11 +1300,11 @@ class Game:
             if self.agent_speed_selector.handle_event(event):
                 self.agent_speed_mode = self.agent_speed_selector.selected
                 return
-            if self.allow_info_overlay and self.info_button_rect.collidepoint(event.pos):
+            if self.info_button_rect.collidepoint(event.pos):
                 self.begin_info_pause()
                 self.configure_intro_images()
                 self.intro_overlay.index = 0
-                self.intro_overlay.set_page_limit(3 if self.signal_mode == "no_signal" else None)
+                self.apply_intro_page_limit()
                 self.show_intro = True
                 return
             if self.pause_button_rect.collidepoint(event.pos):

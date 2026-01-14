@@ -38,17 +38,25 @@ class IntroOverlay:
         self.practice_signal_img = None
         self.practice_signal_until = 0.0
         self.page_limit = None
+        self.practice_speed_px_per_sec = 180.0
+        self.practice_hit_count = 0
+        self._last_index = 0
 
     def set_practice_assets(self, cross_img, target_img):
         self.practice_cross_img = cross_img
         self.practice_target_img = target_img
         self.practice_enabled = cross_img is not None or target_img is not None
         self.practice_sound_loaded = False
+        self.practice_hit_count = 0
 
     def set_practice_signal_assets(self, my_img, left_img, right_img):
         self.practice_signal_img_my = my_img
         self.practice_signal_img_left = left_img
         self.practice_signal_img_right = right_img
+
+    def set_practice_speed(self, speed_px_per_sec: float) -> None:
+        if speed_px_per_sec > 0:
+            self.practice_speed_px_per_sec = float(speed_px_per_sec)
 
     def set_images(self, image_paths):
         self.images = []
@@ -57,6 +65,7 @@ class IntroOverlay:
                 self.images.append(pg.image.load(str(path)).convert_alpha())
             except Exception:
                 self.images.append(None)
+        self.practice_hit_count = 0
 
     def _ensure_practice_sound(self):
         if self.practice_sound_loaded:
@@ -164,14 +173,18 @@ class IntroOverlay:
             self.index += 1
 
     def update(self, dt, joystick, screen_w, screen_h):
-        if not self.practice_enabled or self.index not in (2, 3):
+        if self.index != self._last_index:
+            if self._last_index == 2:
+                self.practice_hit_count = 0
+            self._last_index = self.index
+        if not self.practice_enabled or self.index != 2:
             return
         self._layout(screen_w, screen_h)
         if self.practice_rect.width <= 0 or self.practice_rect.height <= 0:
             return
 
         if self.practice_cross_pos is None:
-            self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.centery]
+            self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.bottom]
 
         move_x = 0.0
         move_y = 0.0
@@ -188,7 +201,7 @@ class IntroOverlay:
             except Exception:
                 pass
 
-        speed = 180.0
+        speed = self.practice_speed_px_per_sec
         self.practice_cross_pos[0] += move_x * speed * dt
         self.practice_cross_pos[1] += move_y * speed * dt
         self.practice_cross_pos[0] = max(
@@ -197,9 +210,6 @@ class IntroOverlay:
         self.practice_cross_pos[1] = max(
             self.practice_rect.top, min(self.practice_rect.bottom, self.practice_cross_pos[1])
         )
-
-        if self.index == 3:
-            return
 
         if self.practice_target_pos is None or self.practice_target_vel is None:
             self._spawn_practice_target()
@@ -243,6 +253,13 @@ class IntroOverlay:
                     self.practice_snd_hit.play()
             except Exception:
                 pass
+            self.practice_hit_count += 1
+            if self.practice_hit_count >= 20:
+                self.practice_target_pos = None
+                self.practice_target_vel = None
+                self.practice_cross_pos = None
+                self.index = min(3, self._page_count() - 1)
+                return
             self._spawn_practice_target()
         elif dist <= cross_r:
             try:
@@ -274,6 +291,8 @@ class IntroOverlay:
         vy = random.uniform(40.0, 60.0)
         self.practice_target_pos = [x, y]
         self.practice_target_vel = [vx, vy]
+        if self.practice_rect.width > 0 and self.practice_rect.height > 0:
+            self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.bottom]
 
     def draw(self, surface, font, screen_w, screen_h):
         self._layout(screen_w, screen_h)
@@ -301,6 +320,15 @@ class IntroOverlay:
         if self.practice_enabled and self.practice_rect.width > 0 and self.index == 2:
             pg.draw.rect(surface, (50, 55, 70), self.practice_rect, border_radius=10)
             pg.draw.rect(surface, (120, 120, 120), self.practice_rect, 2, border_radius=10)
+            label = f"Hits: {self.practice_hit_count}/20"
+            label_surf = font.render(label, True, (20, 20, 20))
+            label_rect = label_surf.get_rect()
+            label_y = max(8, self.practice_rect.top - label_rect.height - 6)
+            label_rect.topright = (self.practice_rect.right, label_y)
+            bg_rect = label_rect.inflate(10, 6)
+            pg.draw.rect(surface, (255, 255, 255, 220), bg_rect, border_radius=6)
+            pg.draw.rect(surface, (120, 120, 120), bg_rect, 1, border_radius=6)
+            surface.blit(label_surf, label_rect)
             if self.practice_explosions:
                 now = time.time()
                 for e in self.practice_explosions:
@@ -330,23 +358,6 @@ class IntroOverlay:
                 else:
                     pg.draw.line(surface, (50, 120, 255), (cx - 12, cy), (cx + 12, cy), 3)
                     pg.draw.line(surface, (50, 120, 255), (cx, cy - 12), (cx, cy + 12), 3)
-        if self.practice_enabled and self.practice_rect.width > 0 and self.index == 3:
-            pg.draw.rect(surface, (50, 55, 70), self.practice_rect, border_radius=10)
-            pg.draw.rect(surface, (120, 120, 120), self.practice_rect, 2, border_radius=10)
-            if self.practice_cross_pos:
-                cx, cy = self.practice_cross_pos
-                img = None
-                if self.practice_signal_until > time.time():
-                    img = self.practice_signal_img
-                if img is None:
-                    img = self.practice_cross_img
-                if img:
-                    rect = img.get_rect(center=(int(cx), int(cy)))
-                    surface.blit(img, rect)
-                else:
-                    pg.draw.line(surface, (50, 120, 255), (cx - 12, cy), (cx + 12, cy), 3)
-                    pg.draw.line(surface, (50, 120, 255), (cx, cy - 12), (cx, cy + 12), 3)
-
         # Close button
         self.close_rect = pg.Rect(0, 0, 28, 28)
         self.close_rect.topright = (self.panel_rect.right - 10, self.panel_rect.top + 10)
@@ -401,10 +412,12 @@ class IntroOverlay:
             gap = 14
             size = int(min(panel_w, panel_h) * 0.5)
             size = max(180, min(size, self.panel_rect.width - gap * 2))
-            right_x = self.panel_rect.right - gap - size - 60
+            width_extra = 60 if self.index == 2 else 0
+            rect_w = size + width_extra
+            right_x = self.panel_rect.right - gap - rect_w - 60
             center_y = self.panel_rect.centery + 60
             height = int(size * 0.9)
-            self.practice_rect = pg.Rect(0, 0, size, height)
+            self.practice_rect = pg.Rect(0, 0, rect_w, height)
             self.practice_rect.topleft = (right_x, center_y - size // 2)
         else:
             self.practice_rect = pg.Rect(0, 0, 0, 0)
