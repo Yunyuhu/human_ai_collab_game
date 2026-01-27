@@ -1036,12 +1036,32 @@ class Game:
             else:
                 self.log_event("miss", triggered_by="human")
         # 若另一方太靠近則會誤傷 -> 施加干擾
-        if self.agent_active():
-            dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
-            if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
-                # 友軍在爆炸預估視覺範圍內，施加誤傷效果（閃頻 + 暫停）
-                self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
-                self.log_event("friendly_fire", triggered_by="human")
+            if self.agent_active():
+                dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
+                if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
+                    # 友軍在爆炸預估視覺範圍內，施加誤傷效果（閃頻 + 暫停）
+                    self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
+                    self.log_event("friendly_fire", triggered_by="human")
+
+    def play_shoot_sound(self) -> None:
+        try:
+            sound_path = self.base_dir / "source" / "shoot.mp3"
+            if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                try:
+                    s = pg.mixer.Sound(str(sound_path))
+                    self.audio.play(s)
+                except Exception:
+                    try:
+                        pg.mixer.Sound(str(sound_path)).play()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    pg.mixer.Sound(str(sound_path)).play()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def apply_agent_slow(self, now: float, duration: float = 2.0, factor: float = 0.5) -> None:
         self.ai_slow_until = max(getattr(self, "ai_slow_until", 0.0), now + duration)
@@ -1336,6 +1356,9 @@ class Game:
                 print(f"Joystick button pressed: {event.button}")
             # Xbox A 鍵發射（通常 button 0）
             if event.button == 0:
+                if self.human_active() and not self.is_target_overlap():
+                    self.log_event("unoverlap_shot", triggered_by="human")
+                    self.play_shoot_sound()
                 self.attempt_human_shot()
             # LT/RT 有些裝置會回報為按鈕
             if event.button in (6, 4, 3):

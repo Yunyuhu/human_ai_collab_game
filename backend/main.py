@@ -199,14 +199,30 @@ def ensure_level_csv(path: Path) -> None:
     )
 
 
-def compute_level_metrics(level_file: Path, score: int, errors: int, start_time: Optional[str], end_time: Optional[str]) -> dict:
+def compute_level_metrics(
+    level_file: Path,
+    score: int,
+    errors: int,
+    start_time: Optional[str],
+    end_time: Optional[str],
+) -> dict:
     overlap_start_times = []
     overlap_end_times = []
     shot_times = []
+    shot_crosshair_positions = []
     success_times = []
     miss_times = []
+    unoverlap_shot_times = []
     overlap_intervals = []
     last_overlap_start = None
+    def parse_float(value: Optional[str]) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
     if level_file.exists():
         with level_file.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -223,10 +239,19 @@ def compute_level_metrics(level_file: Path, score: int, errors: int, start_time:
                         last_overlap_start = None
                 elif event == "shot" and ts:
                     shot_times.append(row.get("timestamp"))
+                    shot_crosshair_positions.append(
+                        {
+                            "timestamp": row.get("timestamp"),
+                            "human_x": parse_float(row.get("human_x")),
+                            "human_y": parse_float(row.get("human_y")),
+                        }
+                    )
                 elif event == "success" and ts:
                     success_times.append(row.get("timestamp"))
                 elif event == "miss" and ts:
                     miss_times.append(row.get("timestamp"))
+                elif event == "unoverlap_shot" and ts:
+                    unoverlap_shot_times.append(row.get("timestamp"))
     end_dt = parse_iso(end_time)
     if last_overlap_start and end_dt:
         overlap_intervals.append((last_overlap_start, end_dt))
@@ -239,6 +264,7 @@ def compute_level_metrics(level_file: Path, score: int, errors: int, start_time:
     success_count = len(success_times)
     miss_count = len(miss_times)
     shot_count = len(shot_times)
+    unoverlap_shot_count = len(unoverlap_shot_times)
     shot_intervals_ms = []
     prev_shot_dt = None
     for ts in shot_times:
@@ -280,9 +306,12 @@ def compute_level_metrics(level_file: Path, score: int, errors: int, start_time:
         "overlap_total_time_ms": overlap_total_time_ms,
         "opportunity_count": opportunity_count,
         "shot_times": shot_times,
+        "shot_crosshair_positions": shot_crosshair_positions,
         "success_times": success_times,
         "miss_times": miss_times,
+        "unoverlap_shot_times": unoverlap_shot_times,
         "shot_count": shot_count,
+        "unoverlap_shot_count": unoverlap_shot_count,
         "shot_interval_mean_ms": shot_interval_mean_ms,
         "shot_interval_min_ms": shot_interval_min_ms,
         "shot_interval_max_ms": shot_interval_max_ms,
@@ -417,6 +446,7 @@ def end_round(req: RoundEnd):
             "miss_count": 0,
             "overlap_total_time_ms": 0.0,
             "shot_count": 0,
+            "unoverlap_shot_count": 0,
             "shot_intervals_ms": [],
         }
         for level in summary["levels"].values():
@@ -428,6 +458,7 @@ def end_round(req: RoundEnd):
             totals["miss_count"] += int(level.get("miss_count") or 0)
             totals["overlap_total_time_ms"] += float(level.get("overlap_total_time_ms") or 0.0)
             totals["shot_count"] += int(level.get("shot_count") or 0)
+            totals["unoverlap_shot_count"] += int(level.get("unoverlap_shot_count") or 0)
             mean_ms = level.get("shot_interval_mean_ms")
             if mean_ms is not None:
                 totals["shot_intervals_ms"].append(float(mean_ms))

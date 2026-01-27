@@ -261,7 +261,7 @@ class IntroOverlay:
                 self.index = min(3, self._page_count() - 1)
                 return
             self._spawn_practice_target()
-        elif dist <= cross_r:
+        else:
             try:
                 if self.practice_snd_shoot:
                     self.practice_snd_shoot.play()

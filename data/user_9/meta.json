@@ -1,0 +1,16 @@
+{
+  "user_id": "009",
+  "conditions": {
+    "A": {
+      "human_speed": 2.2
+    },
+    "B": {
+      "human_speed": 2.4
+    }
+  },
+  "segment_setting": {
+    "practice_sec": 0,
+    "level_sec": 120,
+    "level_count": 3
+  }
+}
