@@ -13,7 +13,6 @@ import api_client
 from audio import AudioManager
 from ui_mode_selector import ModeSelector
 from ui_signal_selector import SignalSelector
-from ui_agent_speed_selector import AgentSpeedSelector
 from voice_signal import VoiceSignalListener
 from ui_intro_overlay import IntroOverlay
 
@@ -28,13 +27,12 @@ GRAY = (80, 80, 80)
 LIGHT_GRAY = (150, 150, 150)
 BLUE = (100, 180, 255)
 ORANGE = (255, 170, 120)
-BG_COLOR = (20, 20, 30)
-PRACTICE_BG_COLOR = (40, 20, 70)
-EXPERIMENT_BG_COLOR = (10, 30, 80)
+BG_COLOR = (10, 20, 60)
+EXPERIMENT_BG_COLOR = (10, 20, 60)
 
 # 遊戲設定
 ROUND_DURATION_MS = 120_000  # 每回合 120 秒
-TOTAL_ROUNDS = 4
+TOTAL_ROUNDS = 5
 
 PADDLE_W, PADDLE_H = 100, 20
 BALL_R = 10
@@ -281,18 +279,6 @@ class Game:
             options=self.mode_options,
             initial_key=self.control_mode,
         )
-        self.agent_speed_options = {
-            "A": "A mode",
-            "B": "B mode",
-            "C": "C mode",
-        }
-        self.agent_speed_mode = "A"
-        self.agent_speed_selector = AgentSpeedSelector(
-            rect=pg.Rect(0, 0, 250, 28),
-            font=self.font_tiny,
-            options=self.agent_speed_options,
-            initial_key=self.agent_speed_mode,
-        )
         self.signal_options = {
             "no_signal": "No Signal",
             "human_dom": "Human Dominant",
@@ -470,8 +456,6 @@ class Game:
                 self.signal_mode = self.signal_selector.selected
                 self.condition_code = CONDITION_BY_MODE[self.signal_mode]
                 return
-            if self.agent_speed_selector.handle_event(event):
-                self.agent_speed_mode = self.agent_speed_selector.selected
                 return
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             if getattr(self, "start_button_rect", None) and self.start_button_rect.collidepoint(event.pos):
@@ -520,7 +504,6 @@ class Game:
         self.screen = pg.display.set_mode((WIDTH, HEIGHT), pg.RESIZABLE)
         self.mode_selector.set_position(12, 10)
         self.signal_selector.set_position(self.mode_selector.rect.right + 12, 10)
-        self.agent_speed_selector.set_position(self.signal_selector.rect.right + 12, 10)
         self.info_button_rect.topright = (WIDTH - 12, 10)
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
@@ -864,11 +847,11 @@ class Game:
 
     def attempt_human_shot(self):
         if not self.human_active():
-            return
+            return False
         now = time.time()
         # 判斷是否冷卻完成
         if now - getattr(self, "last_human_shot", 0.0) <= getattr(self, "human_shot_cooldown", 0.25):
-            return
+            return False
         # 計算準心圖片半徑（若有圖片用圖片尺寸，否則用 explosion_radius）
         if getattr(self, "human_cross_img", None):
             img_radius = self.human_cross_img.get_width() / 2.0
@@ -886,6 +869,28 @@ class Game:
                 # 友軍在爆炸預估視覺範圍內，施加誤傷效果（閃頻 + 暫停）
                 self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
                 self.log_event("friendly_fire", triggered_by="human")
+            return True
+        return False
+
+    def play_shoot_sound(self):
+        try:
+            sound_path = self.base_dir / "source" / "shoot.mp3"
+            if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                try:
+                    s = pg.mixer.Sound(str(sound_path))
+                    self.audio.play(s)
+                except Exception:
+                    try:
+                        pg.mixer.Sound(str(sound_path)).play()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    pg.mixer.Sound(str(sound_path)).play()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def apply_agent_slow(self, now: float, duration: float = 2.0, factor: float = 0.5) -> None:
         self.ai_slow_until = max(getattr(self, "ai_slow_until", 0.0), now + duration)
@@ -961,8 +966,8 @@ class Game:
             self.human_cross_img = self.human_cross_img_base
         if self.ai_cross_img_base is not None:
             self.ai_cross_img = self.ai_cross_img_base
-        self.ai_aim_offset_x = random.uniform(-15.0, 15.0)
-        self.ai_aim_offset_y = random.uniform(-15.0, 15.0)
+        self.ai_aim_offset_x = 0.0
+        self.ai_aim_offset_y = 0.0
         self.ball_vx = random.uniform(-1.5, 1.5)
         self.ball_vy = random.uniform(1.4, 3.0)  # 始終往下移動
         self.clamp_ball_speed()
@@ -1105,8 +1110,6 @@ class Game:
                 self.signal_mode = self.signal_selector.selected
                 self.condition_code = CONDITION_BY_MODE[self.signal_mode]
                 return
-            if self.agent_speed_selector.handle_event(event):
-                self.agent_speed_mode = self.agent_speed_selector.selected
                 return
             if self.info_button_rect.collidepoint(event.pos):
                 self.begin_info_pause()
@@ -1140,7 +1143,9 @@ class Game:
                 print(f"Joystick button pressed: {event.button}")
             # Xbox A 鍵發射（通常 button 0）
             if event.button == 0:
-                self.attempt_human_shot()
+                shot_fired = self.attempt_human_shot()
+                if not shot_fired:
+                    self.play_shoot_sound()
             # LT/RT 有些裝置會回報為按鈕
             if event.button in (6, 4, 3):
                 self.trigger_human_icon_left_right()
@@ -1263,6 +1268,7 @@ class Game:
                     self.round_start_ms = pg.time.get_ticks()
                     self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
                     self.start_round_api()
+                    print(f"Start round {self.current_round}")
                 if self.restart_pending:
                     self.restart_pending = False
                     self.round_start_ms = pg.time.get_ticks()
@@ -1305,7 +1311,7 @@ class Game:
         now = time.time()
         human_penalty_active = now < getattr(self, "human_penalty_until", 0.0)
         ai_penalty_active = now < getattr(self, "ai_penalty_until", 0.0)
-        human_speed = 2.4 * (0.4 if human_penalty_active else 1.0)
+        human_speed = 2.2 * (0.5 if human_penalty_active else 1.0)
         if self.human_active():
             if keys[pg.K_LEFT] or keys[pg.K_a]:
                 self.human_x -= human_speed
@@ -1369,68 +1375,30 @@ class Game:
                 self.ai_track_until = now + random.uniform(0.8, 1.6)
                 ai_active = True
             else:
-                self.ai_idle_until = now + random.uniform(0.6, 1.2)
+                self.ai_idle_until = now + random.uniform(0.3, 1.0)
                 ai_active = False
         aggressive = now < getattr(self, "ai_aggressive_until", 0.0) and now >= getattr(
             self, "human_my_block_until", 0.0
         )
-        if self.agent_speed_mode in ("B", "C") and now >= getattr(self, "human_my_block_until", 0.0):
-            aggressive = True
-        aggressive_boost = now < getattr(self, "ai_aggressive_boost_until", 0.0)
-        if self.agent_speed_mode == "B" and now >= getattr(self, "human_my_block_until", 0.0):
-            aggressive_boost = False
-        elif self.agent_speed_mode == "C" and now >= getattr(self, "human_my_block_until", 0.0):
-            aggressive_boost = True
+        aggressive_boost = True
         passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
-        agent_speed = 1.7
+        agent_speed = 2.0
         if now < getattr(self, "ai_slow_until", 0.0):
             agent_speed *= getattr(self, "ai_slow_factor", 0.5)
         else:
             self.ai_slow_factor = 1.0
-        if aggressive_boost and self.agent_speed_mode == "C":
-            agent_speed *= 1.4
-        elif aggressive and self.agent_speed_mode == "B":
-            agent_speed *= 1.15
-        elif aggressive:
-            agent_speed *= 1.25
-        elif passive:
-            agent_speed *= 0.85
         ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
         ball_travel_total = max(1.0, HEIGHT - ball_spawn_y)
         ball_travel_progress = (self.ball_y - ball_spawn_y) / ball_travel_total
         if self.agent_active() and ai_active and ball_travel_progress >= 0.15:
-            self.ai_aim_offset_x = getattr(self, "ai_aim_offset_x", 0.0)
-            self.ai_aim_offset_y = getattr(self, "ai_aim_offset_y", 0.0)
-            if aggressive_boost and self.agent_speed_mode == "C":
-                jitter_scale = 0.45
-            elif aggressive and self.agent_speed_mode == "B":
-                jitter_scale = 0.7
-            elif aggressive:
-                jitter_scale = 0.55
-            elif passive:
-                jitter_scale = 1.1
-            else:
-                jitter_scale = 1.0
-            self.ai_aim_offset_x += random.uniform(-0.08, 0.08) * jitter_scale
-            self.ai_aim_offset_y += random.uniform(-0.08, 0.08) * jitter_scale
-            self.ai_aim_offset_x = max(-18.0, min(18.0, self.ai_aim_offset_x))
-            self.ai_aim_offset_y = max(-18.0, min(18.0, self.ai_aim_offset_y))
-            target_x = self.ball_x + self.ai_aim_offset_x
-            target_y = self.ball_y + self.ai_aim_offset_y
-            close_lock = False
-            if getattr(self, "ai_cross_img", None):
-                close_lock = dist_agent_to_ball <= (self.ai_cross_img.get_width() / 2.0) * 0.9
-            if close_lock:
-                target_x = self.ball_x
-                target_y = self.ball_y
-            elif random.random() < 0.3:
-                dx = self.agent_x - self.ball_x
-                dy = self.agent_y - self.ball_y
-                mag = math.hypot(dx, dy) or 1.0
-                target_x += (dx / mag) * 40.0
-                target_y += (dy / mag) * 40.0
+            target_x = self.ball_x
+            target_y = self.ball_y
+            # 避免代理人一直衝向分割線上方，偏向維持在分割線以下的中段
+            line_y = int(HEIGHT * 0.35)
+            preferred_min_y = line_y + (HEIGHT - line_y) * 0.5
+            target_y = max(target_y, preferred_min_y)
             if self.agent_x < target_x - 6:
                 self.agent_x += agent_speed
             elif self.agent_x > target_x + 6:
@@ -1473,12 +1441,8 @@ class Game:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
             if dist_agent_to_ball <= ai_img_radius:
                 if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
-                    if aggressive_boost and self.agent_speed_mode == "C":
-                        shot_chance = 0.95
-                    elif aggressive and self.agent_speed_mode == "B":
+                    if aggressive:
                         shot_chance = 0.85
-                    elif aggressive:
-                        shot_chance = 0.95
                     elif passive:
                         shot_chance = 0.75
                     else:
@@ -1602,26 +1566,28 @@ class Game:
         except AttributeError:
             # 若目前沒有 ball_x/ball_y，安全忽略
             pass
-        # 播放射擊 / 命中音（優先 AudioManager，否則 pygame.mixer）
-        try:
-            sound_name = "rifle.mp3" if hit else "shoot.mp3"
-            sound_path = self.base_dir / "source" / sound_name
-            if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                try:
-                    s = pg.mixer.Sound(str(sound_path))
-                    self.audio.play(s)
-                except Exception:
+        # 播放射擊 / 命中音（命中 rifle.mp3，未命中 shoot.mp3）
+        if hit:
+            try:
+                sound_path = self.base_dir / "source" / "rifle.mp3"
+                if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                    try:
+                        s = pg.mixer.Sound(str(sound_path))
+                        self.audio.play(s)
+                    except Exception:
+                        try:
+                            pg.mixer.Sound(str(sound_path)).play()
+                        except Exception:
+                            pass
+                else:
                     try:
                         pg.mixer.Sound(str(sound_path)).play()
                     except Exception:
                         pass
-            else:
-                try:
-                    pg.mixer.Sound(str(sound_path)).play()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            except Exception:
+                pass
+        else:
+            self.play_shoot_sound()
 
     def apply_friendly_penalty(self, target: str, now: float, dur: float = FRIENDLY_FIRE_PENALTY_SEC) -> None:
         """
@@ -1700,10 +1666,7 @@ class Game:
 
     def draw(self):
         if self.state in (GameState.ROUND, GameState.BREAK):
-            if self.current_round == 1:
-                self.screen.fill(PRACTICE_BG_COLOR)
-            else:
-                self.screen.fill(EXPERIMENT_BG_COLOR)
+            self.screen.fill(EXPERIMENT_BG_COLOR)
         else:
             self.screen.fill(BG_COLOR)
 
@@ -1766,19 +1729,13 @@ class Game:
             self.mode_selector.rect.width
             + gap
             + self.signal_selector.rect.width
-            + gap
-            + self.agent_speed_selector.rect.width
         )
         start_x = WIDTH // 2 - total_w // 2
         y = 360
         self.mode_selector.set_position(start_x, y)
         self.signal_selector.set_position(start_x + self.mode_selector.rect.width + gap, y)
-        self.agent_speed_selector.set_position(
-            self.signal_selector.rect.right + gap, y
-        )
         self.mode_selector.draw(self.screen, GRAY, WHITE)
         self.signal_selector.draw(self.screen, GRAY, WHITE)
-        self.agent_speed_selector.draw(self.screen, GRAY, WHITE)
 
         # Start 按鈕
         self.start_button_rect = pg.Rect(WIDTH // 2 - 130, 540, 260, 60)
@@ -1804,12 +1761,11 @@ class Game:
         # 回合中固定左上角
         self.mode_selector.set_position(12, 10)
         self.signal_selector.set_position(self.mode_selector.rect.right + 12, 10)
-        self.agent_speed_selector.set_position(self.signal_selector.rect.right + 12, 10)
         self.info_button_rect.topright = (WIDTH - 12, 10)
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
 
-        # 畫可移動範圍分界線（位於畫面高度的一半）
-        line_y = HEIGHT // 2
+        # 畫可移動範圍分界線（位於畫面高度的 0.35）
+        line_y = int(HEIGHT * 0.35)
         # 半透明橫線
         line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
         line_surf.fill((180, 180, 180, 140))
@@ -1819,7 +1775,6 @@ class Game:
         # 訊號下拉選單（模式旁）
         self.signal_selector.draw(self.screen, GRAY, WHITE)
         # Agent speed 下拉選單（訊號旁）
-        self.agent_speed_selector.draw(self.screen, GRAY, WHITE)
         # 右上角資訊按鈕
         self.draw_info_button()
         self.draw_pause_button()
@@ -1889,13 +1844,10 @@ class Game:
         stats_surf = self.font_small.render(stats_text, True, LIGHT_GRAY)
 
         # 左下角顯示 round（移除 condition）
-        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
+        round_duration_ms = ROUND_DURATION_MS
         remaining_ms = max(0, round_duration_ms - self.get_elapsed_ms())
         remaining_sec = int(math.ceil(remaining_ms / 1000))
-        if self.current_round == 1:
-            round_label = "Practice"
-        else:
-            round_label = f"ROUND:{self.current_round - 1}/{self.total_rounds - 1}"
+        round_label = f"ROUND:{self.current_round}/{self.total_rounds}"
         info_text = (
             f"User: {self.current_user_id} | {round_label} | "
             f"Time: {remaining_sec}s"
@@ -1907,7 +1859,7 @@ class Game:
 
     def draw_break(self):
         # 回合結果畫面
-        round_label = "Practice" if self.current_round == 1 else f"Round {self.current_round-1}"
+        round_label = f"Round {self.current_round}"
         draw_text(
             self.screen,
             f" {round_label} completed",
