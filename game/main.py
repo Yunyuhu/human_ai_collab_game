@@ -31,11 +31,11 @@ BG_COLOR = (10, 20, 60)
 EXPERIMENT_BG_COLOR = (10, 20, 60)
 
 # 遊戲設定
-ROUND_DURATION_MS = 120_000  # 每回合 120 秒
 TOTAL_ROUNDS = 5
+ENEMIES_PER_ROUND = 20
 
 PADDLE_W, PADDLE_H = 100, 20
-BALL_R = 10
+FLIGHT_R = 10
 
 # 新增協作 / 友火相關參數
 SHOOT_RANGE = 120                 # 保留備用（不直接用於內圈判定）
@@ -107,10 +107,11 @@ class Game:
         self.audio = AudioManager(str(self.base_dir))
         self.intro_overlay = IntroOverlay(
             [
-                self.base_dir / "source" / "game_info1.png",
-                self.base_dir / "source" / "game_info2.png",
-                self.base_dir / "source" / "game_info3.png",
-                self.base_dir / "source" / "game_info4.png",
+                self.base_dir / "source" / "info1.png",
+                self.base_dir / "source" / "info2.png",
+                self.base_dir / "source" / "info3.png",
+                self.base_dir / "source" / "info4_signalA.png",
+                self.base_dir / "source" / "info5.png",
             ]
         )
         self.voice_listener = None
@@ -130,7 +131,7 @@ class Game:
         self.ai_cross_img_right = None
         self.ai_cross_img_my = None
         self.target_img = None
-        self.ball_radius = BALL_R
+        self.flight_radius = FLIGHT_R
         try:
             human_path = self.base_dir / "source" / "human_crosshair.png"
             human_left_path = self.base_dir / "source" / "human_your_left.png"
@@ -191,7 +192,7 @@ class Game:
                         (max(1, int(img_t.get_width() * scale)), max(1, int(img_t.get_height() * scale))),
                     )
                 self.target_img = img_t
-                self.ball_radius = max(1, int(max(img_t.get_width(), img_t.get_height()) / 2))
+                self.flight_radius = max(1, int(max(img_t.get_width(), img_t.get_height()) / 2))
             if not (self.human_cross_img or self.ai_cross_img):
                 print("human_crosshair.png / ai_crosshair.png not found in source/, will draw procedural crosshairs.")
         except Exception as e:
@@ -199,7 +200,7 @@ class Game:
             self.human_cross_img = None
             self.ai_cross_img = None
             self.target_img = None
-            self.ball_radius = BALL_R
+            self.flight_radius = FLIGHT_R
 
         if self.intro_overlay:
             try:
@@ -241,6 +242,7 @@ class Game:
         self.current_user_id = None      # 真的開始實驗後才設定
         self.condition_code = None       # 1~4
         self.signal_mode = "negotiation"
+        self.update_intro_images()
         self.current_round = 0
         self.total_rounds = TOTAL_ROUNDS
         self.exp_start_iso: Optional[str] = None
@@ -250,10 +252,10 @@ class Game:
         self.round_score = 0
         self.round_errors = 0
         self.round_collisions = 0
-        self.round_ball_spawn = 0
+        self.round_flight_spawn = 0
         self.round_signal_sent = 0
-        self.round_ball_catch = 0
-        self.round_ball_miss = 0
+        self.round_flight_catch = 0
+        self.round_flight_miss = 0
         self.total_score = 0
         self.total_errors = 0
 
@@ -342,6 +344,7 @@ class Game:
         self.ai_idle_until = 0.0
         self.ai_slow_until = 0.0
         self.ai_slow_factor = 1.0
+        self.agent_slow_status = False
         self.ai_aggressive_until = 0.0
         self.ai_aggressive_boost_until = 0.0
         self.human_my_block_until = 0.0
@@ -375,10 +378,11 @@ class Game:
         self.round_score = 0
         self.round_errors = 0
         self.round_collisions = 0
-        self.round_ball_spawn = 0
+        self.round_flight_spawn = 0
         self.round_signal_sent = 0
-        self.round_ball_catch = 0
-        self.round_ball_miss = 0
+        self.round_flight_catch = 0
+        self.round_flight_miss = 0
+        self.round_enemies_resolved = 0
         if start_timer:
             self.round_start_ms = pg.time.get_ticks()
             self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
@@ -455,6 +459,7 @@ class Game:
             if self.signal_selector.handle_event(event):
                 self.signal_mode = self.signal_selector.selected
                 self.condition_code = CONDITION_BY_MODE[self.signal_mode]
+                self.update_intro_images()
                 return
                 return
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
@@ -789,6 +794,9 @@ class Game:
             self.human_icon_until = now + SIGNAL_ICON_DURATION
             self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 4.0)
             self.ai_aggressive_boost_until = max(getattr(self, "ai_aggressive_boost_until", 0.0), now + 4.0)
+        # 交給 agent -> 恢復原本速度
+        self.agent_slow_status = False
+        self.ai_slow_until = 0.0
 
     def trigger_human_icon_my(self):
         if not self.human_active():
@@ -799,7 +807,9 @@ class Game:
         if self.human_cross_img_my is not None:
             self.human_cross_img = self.human_cross_img_my
             self.human_icon_until = now + SIGNAL_ICON_DURATION
-            self.apply_agent_slow(now, 3.0, factor=0.25)
+            # 交給人類 -> agent 減速
+            self.agent_slow_status = True
+            self.ai_slow_until = 0.0
             self.ai_aggressive_until = 0.0
             self.human_my_block_until = now + 2.5
             self.ai_passive_until = max(getattr(self, "ai_passive_until", 0.0), now + 3.0)
@@ -810,10 +820,19 @@ class Game:
         img = None
         if signal_type == "agent_my":
             img = self.ai_cross_img_my
+            # 交給 agent -> 恢復原本速度
+            self.agent_slow_status = False
+            self.ai_slow_until = 0.0
         elif signal_type == "agent_your_left":
             img = self.ai_cross_img_left
+            # 交給人類 -> agent 減速
+            self.agent_slow_status = True
+            self.ai_slow_until = 0.0
         elif signal_type == "agent_your_right":
             img = self.ai_cross_img_right
+            # 交給人類 -> agent 減速
+            self.agent_slow_status = True
+            self.ai_slow_until = 0.0
         if img is not None:
             self.ai_cross_img = img
             self.agent_icon_until = now + 1.0
@@ -858,7 +877,7 @@ class Game:
         else:
             img_radius = getattr(self, "explosion_radius", 48)
         # 只有當 ball 進入準心圖片區域才允許開火
-        dist_to_ball = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
+        dist_to_ball = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
         if dist_to_ball <= img_radius * 1.1:
             # 建立爆炸（實際命中仍由 create_explosion 判定 inner 1/3）
             self.create_explosion(self.human_x, self.human_y, "human", now)
@@ -902,12 +921,12 @@ class Game:
         if not self.agent_signal_allowed():
             return
         # 只在畫面略高於 1/2 到 2/3 高度範圍內才隨機判斷是否發送
-        if self.ball_y < HEIGHT * 0.4 or self.ball_y > HEIGHT * 2 / 3:
+        if self.flight_y < HEIGHT * 0.4 or self.flight_y > HEIGHT * 2 / 3:
             return
         if random.random() > 0.5:
             return
-        dist_agent = math.hypot(self.ball_x - self.agent_x, self.ball_y - self.agent_y)
-        dist_human = math.hypot(self.ball_x - self.human_x, self.ball_y - self.human_y)
+        dist_agent = math.hypot(self.flight_x - self.agent_x, self.flight_y - self.agent_y)
+        dist_human = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
         denom = max(1e-6, dist_agent + dist_human)
         dir_ratio = dist_agent / denom
         jitter = random.uniform(0.85, 1.15)
@@ -930,7 +949,8 @@ class Game:
             if signal_type == "agent_my":
                 self.ai_aggressive_until = now + 3.0
             if signal_type in ("agent_your_left", "agent_your_right"):
-                self.apply_agent_slow(now, 2.0, factor=0.5)
+                self.agent_slow_status = True
+                self.ai_slow_until = 0.0
 
     def update_agent_dir_behavior(self, now: float) -> None:
         return
@@ -958,9 +978,25 @@ class Game:
     def reset_ball_random(self):
         # 生成一個從上方下落的目標（不反彈，水平有隨機漂移）
         import random
-        self.ball_x = random.uniform(40, WIDTH - 40)
-        self.ball_y = -20
-        self.ball_spawn_y = self.ball_y
+        if getattr(self, "round_enemies_resolved", 0) >= ENEMIES_PER_ROUND:
+            return
+        if self.signal_mode in ("human_dom", "agent_dom", "negotiation"):
+            self.agent_slow_status = False
+        left_bound = 40
+        right_bound = WIDTH - 40
+        span = max(1.0, right_bound - left_bound)
+        zone_w = span / 3.0
+        roll = random.random()
+        if roll < 0.2:
+            zone_start = left_bound
+        elif roll < 0.8:
+            zone_start = left_bound + zone_w
+        else:
+            zone_start = left_bound + zone_w * 2
+        zone_end = zone_start + zone_w
+        self.flight_x = random.uniform(zone_start, min(zone_end, right_bound))
+        self.flight_y = -20
+        self.flight_spawn_y = self.flight_y
         self.signal_sent_for_ball = False
         if self.human_cross_img_base is not None:
             self.human_cross_img = self.human_cross_img_base
@@ -968,22 +1004,31 @@ class Game:
             self.ai_cross_img = self.ai_cross_img_base
         self.ai_aim_offset_x = 0.0
         self.ai_aim_offset_y = 0.0
-        self.ball_vx = random.uniform(-1.5, 1.5)
-        self.ball_vy = random.uniform(1.4, 3.0)  # 始終往下移動
+        self.flight_vx = random.uniform(-1.5, 1.5)
+        self.flight_vy = random.uniform(1.4, 3.0)  # 始終往下移動
         self.clamp_ball_speed()
-        self.round_ball_spawn += 1
+        self.round_flight_spawn += 1
         self.log_event("ball_spawn", triggered_by="system")
+
+    def advance_or_end_round(self) -> bool:
+        """處理敵機結算：達到上限則結束回合，否則生成下一隻。"""
+        if getattr(self, "round_enemies_resolved", 0) >= ENEMIES_PER_ROUND:
+            self.finish_round()
+            self.state = GameState.BREAK
+            return True
+        self.reset_ball_random()
+        return False
 
     def clamp_ball_speed(self):
         """避免速度過低或過高，控制在合理範圍。"""
         max_speed = 12
         min_speed = 2.0
-        self.ball_vx = max(-max_speed, min(max_speed, self.ball_vx))
-        self.ball_vy = max(-max_speed, min(max_speed, self.ball_vy))
-        if 0 < abs(self.ball_vx) < min_speed:
-            self.ball_vx = min_speed if self.ball_vx >= 0 else -min_speed
-        if 0 < abs(self.ball_vy) < min_speed:
-            self.ball_vy = min_speed if self.ball_vy >= 0 else -min_speed
+        self.flight_vx = max(-max_speed, min(max_speed, self.flight_vx))
+        self.flight_vy = max(-max_speed, min(max_speed, self.flight_vy))
+        if 0 < abs(self.flight_vx) < min_speed:
+            self.flight_vx = min_speed if self.flight_vx >= 0 else -min_speed
+        if 0 < abs(self.flight_vy) < min_speed:
+            self.flight_vy = min_speed if self.flight_vy >= 0 else -min_speed
 
     def rotate_velocity(self, deg_min: float = 30, deg_max: float = 50) -> None:
         """將速度向量旋轉一個隨機角度（deg_min~deg_max），增加角度變化。"""
@@ -992,9 +1037,9 @@ class Game:
         angle_rad = math.radians(angle_deg)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
-        vx, vy = self.ball_vx, self.ball_vy
-        self.ball_vx = vx * cos_a - vy * sin_a
-        self.ball_vy = vx * sin_a + vy * cos_a
+        vx, vy = self.flight_vx, self.flight_vy
+        self.flight_vx = vx * cos_a - vy * sin_a
+        self.flight_vy = vx * sin_a + vy * cos_a
 
     # --- API / LOGGING ---
     def _agent_human_flags(self) -> tuple[bool, bool]:
@@ -1008,6 +1053,38 @@ class Game:
             return True, True
         return False, False
 
+    def update_intro_images(self) -> None:
+        if not self.intro_overlay:
+            return
+        base = self.base_dir / "source"
+        image_paths = [
+            base / "info1.png",
+            base / "info2.png",
+            base / "info3.png",
+        ]
+        if self.signal_mode in ("human_dom", "negotiation"):
+            image_paths.append(base / "info4_signalH.png")
+        elif self.signal_mode == "agent_dom":
+            image_paths.append(base / "info4_signalA.png")
+        image_paths.append(base / "info5.png")
+        self.intro_overlay.set_images(image_paths)
+        if self.signal_mode in ("human_dom", "negotiation"):
+            self.intro_overlay.set_signal_variant("H")
+            self.intro_overlay.set_practice_signal_assets(
+                self.human_cross_img_my,
+                self.human_cross_img_left,
+                self.human_cross_img_right,
+            )
+        elif self.signal_mode == "agent_dom":
+            self.intro_overlay.set_signal_variant("A")
+            self.intro_overlay.set_practice_signal_assets(
+                self.human_cross_img_my,
+                self.human_cross_img_left,
+                self.human_cross_img_right,
+            )
+        else:
+            self.intro_overlay.set_signal_variant("none")
+
     def log_event(
         self,
         event_type: str,
@@ -1017,16 +1094,16 @@ class Game:
     ) -> None:
         if self.current_user_id is None or self.condition_code is None or self.current_round is None:
             return
-        speed = math.sqrt(self.ball_vx ** 2 + self.ball_vy ** 2)
-        angle = math.degrees(math.atan2(self.ball_vy, self.ball_vx))
+        speed = math.sqrt(self.flight_vx ** 2 + self.flight_vy ** 2)
+        angle = math.degrees(math.atan2(self.flight_vy, self.flight_vx))
         payload = {
             "user_id": self.current_user_id,
             "condition": self.condition_code,
             "round_id": self.current_round,
             "timestamp": dt.datetime.utcnow().isoformat() + "Z",
             "event_type": event_type,
-            "ball_x": int(self.ball_x),
-            "ball_y": int(self.ball_y),
+            "flight_x": int(self.flight_x),
+            "flight_y": int(self.flight_y),
             "human_x": int(self.human_x),
             "human_y": int(self.human_y),
             "agent_x": int(self.agent_x),
@@ -1034,8 +1111,8 @@ class Game:
             "triggered_by": triggered_by,
             "signal_type": signal_type,
             "dir_ratio": dir_ratio,
-            "ball_speed": round(speed, 3),
-            "ball_angle": round(angle, 3),
+            "flight_speed": round(speed, 3),
+            "flight_angle": round(angle, 3),
         }
         api_client.log_event(payload)
 
@@ -1093,10 +1170,10 @@ class Game:
             self.round_score,
             self.round_errors,
             self.round_collisions,
-            self.round_ball_spawn,
+            self.round_flight_spawn,
             self.round_signal_sent,
-            self.round_ball_catch,
-            self.round_ball_miss,
+            self.round_flight_catch,
+            self.round_flight_miss,
             agent_active,
             human_active,
         )
@@ -1109,6 +1186,7 @@ class Game:
             if self.signal_selector.handle_event(event):
                 self.signal_mode = self.signal_selector.selected
                 self.condition_code = CONDITION_BY_MODE[self.signal_mode]
+                self.update_intro_images()
                 return
                 return
             if self.info_button_rect.collidepoint(event.pos):
@@ -1219,10 +1297,10 @@ class Game:
     def go_next_round_or_done(self):
         if self.current_round < self.total_rounds:
             self.current_round += 1
-            self.reset_round_stats()
-            self.start_round_api()
+            self.reset_round_stats(start_timer=False)
+            self.pending_start = True
             self.state = GameState.ROUND
-            print(f"Start round {self.current_round}")
+            self.start_countdown(3)
         else:
             # 結束實驗
             if not self.exp_logged and self.exp_start_iso:
@@ -1285,12 +1363,6 @@ class Game:
             return
         if getattr(self, "countdown_active", False):
             return
-        round_duration_ms = 60_000 if self.current_round == 1 else ROUND_DURATION_MS
-        if self.get_elapsed_ms() >= round_duration_ms:
-            self.finish_round()
-            self.state = GameState.BREAK
-            return
-
         # 更新 freeze/flash 計時（ms）
         if getattr(self, "conflict_freeze_ms", 0) > 0:
             self.conflict_freeze_ms = max(0, self.conflict_freeze_ms - delta * 1000)
@@ -1342,26 +1414,27 @@ class Game:
             self.human_y = max(HEIGHT // 2, min(HEIGHT - 10, self.human_y))
 
         # 目標下落
-        self.ball_x += self.ball_vx
-        self.ball_y += self.ball_vy
+        self.flight_x += self.flight_vx
+        self.flight_y += self.flight_vy
         # 下落時加入水平隨機漂移（y 軸維持往下）
-        self.ball_x += random.uniform(-0.8, 0.8)
+        self.flight_x += random.uniform(-0.8, 0.8)
         if random.random() < 0.06:
-            self.ball_vx += random.uniform(-0.7, 0.7)
-            self.ball_vx = max(-3.2, min(3.2, self.ball_vx))
-        if self.ball_x < 20:
-            self.ball_x = 20
-            self.ball_vx = abs(self.ball_vx) * 0.6
-        if self.ball_x > WIDTH - 20:
-            self.ball_x = WIDTH - 20
-            self.ball_vx = -abs(self.ball_vx) * 0.6
+            self.rotate_velocity(deg_min=20, deg_max=30)
+            if self.flight_vy < 0:
+                self.flight_vy = abs(self.flight_vy)
+        if self.flight_x < 20:
+            self.flight_x = 20
+            self.flight_vx = abs(self.flight_vx) * 0.6
+        if self.flight_x > WIDTH - 20:
+            self.flight_x = WIDTH - 20
+            self.flight_vx = -abs(self.flight_vx) * 0.6
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
             self.maybe_send_agent_signal(now)
 
         # AI 對齊並在條件下引爆
-        dist_agent_to_ball = math.hypot(self.ball_x - self.agent_x, self.ball_y - self.agent_y)
+        dist_agent_to_ball = math.hypot(self.flight_x - self.agent_x, self.flight_y - self.agent_y)
         ai_active = False
         if now < getattr(self, "ai_idle_until", 0.0):
             ai_active = False
@@ -1385,16 +1458,14 @@ class Game:
         if aggressive:
             ai_active = True
         agent_speed = 2.0
-        if now < getattr(self, "ai_slow_until", 0.0):
-            agent_speed *= getattr(self, "ai_slow_factor", 0.5)
-        else:
-            self.ai_slow_factor = 1.0
-        ball_spawn_y = getattr(self, "ball_spawn_y", -20.0)
-        ball_travel_total = max(1.0, HEIGHT - ball_spawn_y)
-        ball_travel_progress = (self.ball_y - ball_spawn_y) / ball_travel_total
-        if self.agent_active() and ai_active and ball_travel_progress >= 0.15:
-            target_x = self.ball_x
-            target_y = self.ball_y
+        if getattr(self, "agent_slow_status", False):
+            agent_speed *= 0.5
+        flight_spawn_y = getattr(self, "flight_spawn_y", -20.0)
+        flight_travel_total = max(1.0, HEIGHT - flight_spawn_y)
+        flight_travel_progress = (self.flight_y - flight_spawn_y) / flight_travel_total
+        if self.agent_active() and ai_active and flight_travel_progress >= 0.15:
+            target_x = self.flight_x
+            target_y = self.flight_y
             # 避免代理人一直衝向分割線上方，偏向維持在分割線以下的中段
             line_y = int(HEIGHT * 0.35)
             preferred_min_y = line_y + (HEIGHT - line_y) * 0.5
@@ -1410,7 +1481,7 @@ class Game:
             self.agent_x = max(0, min(WIDTH, self.agent_x))
             self.agent_y = max(HEIGHT // 2, min(HEIGHT - 10, self.agent_y))
 
-        ball_caught = False
+        flight_caught = False
         if self.agent_active() and ai_active:
             if getattr(self, "ai_cross_img", None):
                 ai_img_radius = self.ai_cross_img.get_width() / 2.0
@@ -1421,19 +1492,19 @@ class Game:
                     self.agent_close_shot_time = now + random.uniform(0.2, 0.4)
                     self.agent_close_shot_due = now
                 if now >= self.agent_close_shot_time:
-                    self.round_ball_catch = getattr(self, "round_ball_catch", 0) + 1
+                    self.round_flight_catch = getattr(self, "round_flight_catch", 0) + 1
                     self.log_event("ball_catch", triggered_by="agent")
                     self.create_explosion(self.agent_x, self.agent_y, "agent", now)
                     self.last_ai_shot = now
                     self.agent_close_shot_time = None
                     self.agent_close_shot_due = None
-                    ball_caught = True
+                    flight_caught = True
             else:
                 self.agent_close_shot_time = None
                 self.agent_close_shot_due = None
 
         # AI 射擊：需在「AI 準心圖片區域」內才會引爆；若太靠近人類則會造成友火干擾
-        if self.agent_active() and ai_active and not ball_caught:
+        if self.agent_active() and ai_active and not flight_caught:
             # 用 AI 圖片半徑做為可發射判定（若沒有圖片退回 explosion_radius）
             if getattr(self, "ai_cross_img", None):
                 ai_img_radius = self.ai_cross_img.get_width() / 2.0
@@ -1468,10 +1539,12 @@ class Game:
             self.update_agent_icon(now)
 
         # 檢查目標通過底線
-        ball_r = getattr(self, "ball_radius", BALL_R)
-        if self.ball_y - ball_r > HEIGHT:
+        flight_r = getattr(self, "flight_radius", FLIGHT_R)
+        if self.flight_y - flight_r > HEIGHT:
             self.round_errors = getattr(self, "round_errors", 0) + 1
             self.log_event("ball_miss", triggered_by="system")
+            self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
+            self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
             try:
                 denied_path = self.base_dir / "source" / "denied.mp3"
                 if hasattr(self, "audio") and getattr(self.audio, "play", None):
@@ -1493,7 +1566,8 @@ class Game:
                         pass
             except Exception:
                 pass
-            self.reset_ball_random()
+            if self.advance_or_end_round():
+                return
 
         # 檢查準心重疊（靠太近會造成被動干擾）
         if self.human_active() and self.agent_active() and not getattr(self, "hide_mode_ui", False):
@@ -1533,7 +1607,7 @@ class Game:
         # 立即檢查是否命中當前目標（ball）
         hit = False
         try:
-            dist = math.hypot(self.ball_x - x, self.ball_y - y)
+            dist = math.hypot(self.flight_x - x, self.flight_y - y)
             # 命中條件：在爆炸半徑的 INNER_SHOOT_FACTOR（例如 1/3）內才算命中
             hit_radius = exp["r"] * INNER_SHOOT_FACTOR
             if owner == "human":
@@ -1544,8 +1618,10 @@ class Game:
                 hit = True
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
+                self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
                 self.log_event("ball_hit", triggered_by=owner)
-                self.reset_ball_random()
+                if self.advance_or_end_round():
+                    return
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
             visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
             if owner == "human":
@@ -1564,7 +1640,7 @@ class Game:
                         self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
                         self.log_event("friendly_fire", triggered_by="agent")
         except AttributeError:
-            # 若目前沒有 ball_x/ball_y，安全忽略
+            # 若目前沒有 flight_x/flight_y，安全忽略
             pass
         # 播放射擊 / 命中音（命中 rifle.mp3，未命中 shoot.mp3）
         if hit:
@@ -1652,15 +1728,17 @@ class Game:
         if not hasattr(self, "bullets"):
             return
         for b in list(self.bullets):
-            if abs(b["x"] - self.ball_x) < 20 and abs(b["y"] - self.ball_y) < 20:
+            if abs(b["x"] - self.flight_x) < 20 and abs(b["y"] - self.flight_y) < 20:
                 # 擊中：加分、記錄事件，重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.log_event("ball_hit", triggered_by=b.get("owner", "human"))
+                self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
                 try:
                     self.bullets.remove(b)
                 except ValueError:
                     pass
-                self.reset_ball_random()
+                if self.advance_or_end_round():
+                    return
 
     # --- 繪圖 ---
 
@@ -1782,10 +1860,10 @@ class Game:
         self.draw_mic_status()
         # 畫下落目標
         if getattr(self, "target_img", None):
-            rect = self.target_img.get_rect(center=(int(self.ball_x), int(self.ball_y)))
+            rect = self.target_img.get_rect(center=(int(self.flight_x), int(self.flight_y)))
             self.screen.blit(self.target_img, rect)
         else:
-            pg.draw.circle(self.screen, WHITE, (int(self.ball_x), int(self.ball_y)), BALL_R)
+            pg.draw.circle(self.screen, WHITE, (int(self.flight_x), int(self.flight_y)), FLIGHT_R)
 
         # 人類準心（圖片或 fallback）
         if self.human_active():
@@ -1844,13 +1922,9 @@ class Game:
         stats_surf = self.font_small.render(stats_text, True, LIGHT_GRAY)
 
         # 左下角顯示 round（移除 condition）
-        round_duration_ms = ROUND_DURATION_MS
-        remaining_ms = max(0, round_duration_ms - self.get_elapsed_ms())
-        remaining_sec = int(math.ceil(remaining_ms / 1000))
         round_label = f"ROUND:{self.current_round}/{self.total_rounds}"
         info_text = (
-            f"User: {self.current_user_id} | {round_label} | "
-            f"Time: {remaining_sec}s"
+            f"User: {self.current_user_id} | {round_label}"
         )
         info_pos = (20, HEIGHT - 30)
         draw_text(self.screen, info_text, self.font_small, LIGHT_GRAY, info_pos)
