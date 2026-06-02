@@ -322,11 +322,12 @@ class Game:
     def reset_round_objects(self):
         """重置目標與準心等物件"""
         self.reset_ball_random()
-        # 初始位置避免重疊：左右偏移確保不在同一位置
-        offset = 100
-        self.human_x = max(50, WIDTH // 2 - offset)
+        # 固定左右位置
+        left_x = max(20, int(WIDTH * 0.25))
+        right_x = min(WIDTH - 20, int(WIDTH * 0.75))
+        self.human_x = left_x
         self.human_y = int(HEIGHT * 0.82)
-        self.agent_x = min(WIDTH - 50, WIDTH // 2 + offset)
+        self.agent_x = right_x
         self.agent_y = self.human_y
         self.hit_cooldown_ms = 0
 
@@ -353,6 +354,8 @@ class Game:
         self.agent_close_shot_time = None
         self.agent_close_shot_due = None
         self.signal_sent_for_ball = False
+        self.end_round_pending_until = None
+        self.end_game_after_round = False
 
         # 友火 / 干擾狀態
         self.human_penalty_until = 0.0
@@ -383,6 +386,8 @@ class Game:
         self.round_flight_catch = 0
         self.round_flight_miss = 0
         self.round_enemies_resolved = 0
+        self.end_round_pending_until = None
+        self.end_game_after_round = False
         if start_timer:
             self.round_start_ms = pg.time.get_ticks()
             self.round_start_iso = dt.datetime.utcnow().isoformat() + "Z"
@@ -896,8 +901,11 @@ class Game:
             sound_path = self.base_dir / "source" / "shoot.mp3"
             if hasattr(self, "audio") and getattr(self.audio, "play", None):
                 try:
-                    s = pg.mixer.Sound(str(sound_path))
-                    self.audio.play(s)
+                    if hasattr(self.audio, "snd_shoot"):
+                        self.audio.play(self.audio.snd_shoot)
+                    else:
+                        s = pg.mixer.Sound(str(sound_path))
+                        self.audio.play(s)
                 except Exception:
                     try:
                         pg.mixer.Sound(str(sound_path)).play()
@@ -937,8 +945,11 @@ class Game:
         elif dir_ratio > 0.6:
             signal_type = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
         else:
-            if random.random() < 0.5:
+            roll = random.random()
+            if roll < 1 / 3:
                 signal_type = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
+            elif roll < 2 / 3:
+                signal_type = "agent_my"
             else:
                 signal_type = None
         if signal_type:
@@ -1013,8 +1024,8 @@ class Game:
     def advance_or_end_round(self) -> bool:
         """處理敵機結算：達到上限則結束回合，否則生成下一隻。"""
         if getattr(self, "round_enemies_resolved", 0) >= ENEMIES_PER_ROUND:
-            self.finish_round()
-            self.state = GameState.BREAK
+            if getattr(self, "end_round_pending_until", None) is None:
+                self.end_round_pending_until = time.time() + 1.0
             return True
         self.reset_ball_random()
         return False
@@ -1029,6 +1040,9 @@ class Game:
             self.flight_vx = min_speed if self.flight_vx >= 0 else -min_speed
         if 0 < abs(self.flight_vy) < min_speed:
             self.flight_vy = min_speed if self.flight_vy >= 0 else -min_speed
+
+    def get_divider_y(self) -> int:
+        return int(HEIGHT * 0.35)
 
     def rotate_velocity(self, deg_min: float = 30, deg_max: float = 50) -> None:
         """將速度向量旋轉一個隨機角度（deg_min~deg_max），增加角度變化。"""
@@ -1062,25 +1076,46 @@ class Game:
             base / "info2.png",
             base / "info3.png",
         ]
-        if self.signal_mode in ("human_dom", "negotiation"):
+        if self.signal_mode == "human_dom":
             image_paths.append(base / "info4_signalH.png")
         elif self.signal_mode == "agent_dom":
             image_paths.append(base / "info4_signalA.png")
+        elif self.signal_mode == "negotiation":
+            image_paths.append(base / "info4_signalH.png")
+            image_paths.append(base / "info4_signalA.png")
         image_paths.append(base / "info5.png")
         self.intro_overlay.set_images(image_paths)
-        if self.signal_mode in ("human_dom", "negotiation"):
-            self.intro_overlay.set_signal_variant("H")
-            self.intro_overlay.set_practice_signal_assets(
+        self.intro_overlay.clear_signal_practice_configs()
+        if self.signal_mode == "human_dom":
+            self.intro_overlay.set_signal_practice_config(
+                3,
+                "H",
                 self.human_cross_img_my,
                 self.human_cross_img_left,
                 self.human_cross_img_right,
             )
         elif self.signal_mode == "agent_dom":
-            self.intro_overlay.set_signal_variant("A")
-            self.intro_overlay.set_practice_signal_assets(
+            self.intro_overlay.set_signal_practice_config(
+                3,
+                "A",
+                self.ai_cross_img_my,
+                self.ai_cross_img_left,
+                self.ai_cross_img_right,
+            )
+        elif self.signal_mode == "negotiation":
+            self.intro_overlay.set_signal_practice_config(
+                3,
+                "H",
                 self.human_cross_img_my,
                 self.human_cross_img_left,
                 self.human_cross_img_right,
+            )
+            self.intro_overlay.set_signal_practice_config(
+                4,
+                "A",
+                self.ai_cross_img_my,
+                self.ai_cross_img_left,
+                self.ai_cross_img_right,
             )
         else:
             self.intro_overlay.set_signal_variant("none")
@@ -1384,6 +1419,10 @@ class Game:
         human_penalty_active = now < getattr(self, "human_penalty_until", 0.0)
         ai_penalty_active = now < getattr(self, "ai_penalty_until", 0.0)
         human_speed = 2.2 * (0.5 if human_penalty_active else 1.0)
+        # 固定左右位置（仍允許上下移動）
+        fixed_left_x = max(20, int(WIDTH * 0.25))
+        fixed_right_x = min(WIDTH - 20, int(WIDTH * 0.75))
+
         if self.human_active():
             if keys[pg.K_LEFT] or keys[pg.K_a]:
                 self.human_x -= human_speed
@@ -1410,8 +1449,9 @@ class Game:
                     self.joystick_axes = []
             self.update_trigger_icons(now)
             self.process_voice_events(now)
-            self.human_x = max(0, min(WIDTH, self.human_x))
-            self.human_y = max(HEIGHT // 2, min(HEIGHT - 10, self.human_y))
+            self.human_x = fixed_left_x
+            min_y = self.get_divider_y()
+            self.human_y = max(min_y, min(HEIGHT - 10, self.human_y))
 
         # 目標下落
         self.flight_x += self.flight_vx
@@ -1467,19 +1507,16 @@ class Game:
             target_x = self.flight_x
             target_y = self.flight_y
             # 避免代理人一直衝向分割線上方，偏向維持在分割線以下的中段
-            line_y = int(HEIGHT * 0.35)
+            line_y = self.get_divider_y()
             preferred_min_y = line_y + (HEIGHT - line_y) * 0.5
             target_y = max(target_y, preferred_min_y)
-            if self.agent_x < target_x - 6:
-                self.agent_x += agent_speed
-            elif self.agent_x > target_x + 6:
-                self.agent_x -= agent_speed
             if self.agent_y < target_y - 6:
                 self.agent_y += agent_speed
             elif self.agent_y > target_y + 6:
                 self.agent_y -= agent_speed
-            self.agent_x = max(0, min(WIDTH, self.agent_x))
-            self.agent_y = max(HEIGHT // 2, min(HEIGHT - 10, self.agent_y))
+            self.agent_x = fixed_right_x
+            min_y = self.get_divider_y()
+            self.agent_y = max(min_y, min(HEIGHT - 10, self.agent_y))
 
         flight_caught = False
         if self.agent_active() and ai_active:
@@ -1538,36 +1575,60 @@ class Game:
         if self.agent_active():
             self.update_agent_icon(now)
 
+        # 若已進入結束等待，優先處理結束邏輯
+        if getattr(self, "end_round_pending_until", None) is not None:
+            if time.time() >= self.end_round_pending_until:
+                self.end_round_pending_until = None
+                self.finish_round()
+                if getattr(self, "end_game_after_round", False):
+                    if not self.exp_logged and self.exp_start_iso:
+                        self.end_experiment_api()
+                    self.state = GameState.DONE
+                    print("Experiment DONE")
+                else:
+                    self.state = GameState.BREAK
+            return
+
+        # 若已達本回合上限，直接進入結束等待（避免繼續計算 miss）
+        if getattr(self, "round_enemies_resolved", 0) >= ENEMIES_PER_ROUND:
+            self.end_round_pending_until = time.time() + 1.0
+            # 20 隻後結束整場遊戲
+            self.end_game_after_round = True
+            return
+
         # 檢查目標通過底線
         flight_r = getattr(self, "flight_radius", FLIGHT_R)
         if self.flight_y - flight_r > HEIGHT:
-            self.round_errors = getattr(self, "round_errors", 0) + 1
-            self.log_event("ball_miss", triggered_by="system")
-            self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
-            self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
-            try:
-                denied_path = self.base_dir / "source" / "denied.mp3"
-                if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                    try:
-                        if hasattr(self.audio, "snd_denied"):
-                            self.audio.play(self.audio.snd_denied)
-                        else:
-                            s = pg.mixer.Sound(str(denied_path))
-                            self.audio.play(s)
-                    except Exception:
+            if getattr(self, "end_round_pending_until", None) is not None:
+                pass
+            else:
+                self.round_errors = getattr(self, "round_errors", 0) + 1
+                self.log_event("ball_miss", triggered_by="system")
+                self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
+                self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
+                try:
+                    denied_path = self.base_dir / "source" / "denied.mp3"
+                    if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                        try:
+                            if hasattr(self.audio, "snd_denied"):
+                                self.audio.play(self.audio.snd_denied)
+                            else:
+                                s = pg.mixer.Sound(str(denied_path))
+                                self.audio.play(s)
+                        except Exception:
+                            try:
+                                pg.mixer.Sound(str(denied_path)).play()
+                            except Exception:
+                                pass
+                    else:
                         try:
                             pg.mixer.Sound(str(denied_path)).play()
                         except Exception:
                             pass
-                else:
-                    try:
-                        pg.mixer.Sound(str(denied_path)).play()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            if self.advance_or_end_round():
-                return
+                except Exception:
+                    pass
+                if self.advance_or_end_round():
+                    return
 
         # 檢查準心重疊（靠太近會造成被動干擾）
         if self.human_active() and self.agent_active() and not getattr(self, "hide_mode_ui", False):
@@ -1606,6 +1667,7 @@ class Game:
         self.explosions.append(exp)
         # 立即檢查是否命中當前目標（ball）
         hit = False
+        end_round = False
         try:
             dist = math.hypot(self.flight_x - x, self.flight_y - y)
             # 命中條件：在爆炸半徑的 INNER_SHOOT_FACTOR（例如 1/3）內才算命中
@@ -1620,8 +1682,7 @@ class Game:
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
                 self.log_event("ball_hit", triggered_by=owner)
-                if self.advance_or_end_round():
-                    return
+                end_round = self.advance_or_end_round()
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
             visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
             if owner == "human":
@@ -1648,8 +1709,11 @@ class Game:
                 sound_path = self.base_dir / "source" / "rifle.mp3"
                 if hasattr(self, "audio") and getattr(self.audio, "play", None):
                     try:
-                        s = pg.mixer.Sound(str(sound_path))
-                        self.audio.play(s)
+                        if hasattr(self.audio, "snd_rifle"):
+                            self.audio.play(self.audio.snd_rifle)
+                        else:
+                            s = pg.mixer.Sound(str(sound_path))
+                            self.audio.play(s)
                     except Exception:
                         try:
                             pg.mixer.Sound(str(sound_path)).play()
@@ -1664,6 +1728,8 @@ class Game:
                 pass
         else:
             self.play_shoot_sound()
+        if end_round:
+            return
 
     def apply_friendly_penalty(self, target: str, now: float, dur: float = FRIENDLY_FIRE_PENALTY_SEC) -> None:
         """
@@ -1843,7 +1909,7 @@ class Game:
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
 
         # 畫可移動範圍分界線（位於畫面高度的 0.35）
-        line_y = int(HEIGHT * 0.35)
+        line_y = self.get_divider_y()
         # 半透明橫線
         line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
         line_surf.fill((180, 180, 180, 140))

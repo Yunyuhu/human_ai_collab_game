@@ -51,10 +51,14 @@ class IntroOverlay:
         self.signal_snd_right = None
         self.signal_snd_false = None
         self.signal_snd_wrong = None
+        self.signal_snd_agent_my = None
+        self.signal_snd_agent_your = None
         self.signal_assets_loaded = False
         self.last_screen_w = 0
         self.last_screen_h = 0
         self.last_index = 0
+        self.signal_practice_configs = {}
+        self.practice_signal_delay_until = 0.0
 
     def _load_images(self, image_paths):
         self.images = []
@@ -79,6 +83,13 @@ class IntroOverlay:
         self.practice_signal_img_my = my_img
         self.practice_signal_img_left = left_img
         self.practice_signal_img_right = right_img
+        if not self.signal_practice_configs and self.practice_signal_variant in ("H", "A"):
+            self.signal_practice_configs[3] = {
+                "variant": self.practice_signal_variant,
+                "my": my_img,
+                "left": left_img,
+                "right": right_img,
+            }
 
     def set_signal_variant(self, variant: str):
         self.practice_signal_variant = variant
@@ -88,6 +99,59 @@ class IntroOverlay:
         self.practice_signal_next_time = 0.0
         self.practice_signal_feedback_img = None
         self.practice_signal_feedback_until = 0.0
+        if not self.signal_practice_configs and variant in ("H", "A"):
+            self.signal_practice_configs[3] = {
+                "variant": variant,
+                "my": self.practice_signal_img_my,
+                "left": self.practice_signal_img_left,
+                "right": self.practice_signal_img_right,
+            }
+
+    def clear_signal_practice_configs(self):
+        self.signal_practice_configs = {}
+
+    def set_signal_practice_config(self, index: int, variant: str, my_img, left_img, right_img):
+        self.signal_practice_configs[index] = {
+            "variant": variant,
+            "my": my_img,
+            "left": left_img,
+            "right": right_img,
+        }
+        if self.index == index:
+            self._apply_signal_practice_config(index)
+
+    def _is_signal_practice_index(self, index: int) -> bool:
+        if self.signal_practice_configs:
+            return index in self.signal_practice_configs
+        return index == 3
+
+    def _apply_signal_practice_config(self, index: int):
+        if not self.signal_practice_configs:
+            return
+        config = self.signal_practice_configs.get(index)
+        if not config:
+            return
+        self.practice_signal_img_my = config["my"]
+        self.practice_signal_img_left = config["left"]
+        self.practice_signal_img_right = config["right"]
+        self.set_signal_variant(config["variant"])
+
+    def _maybe_apply_signal_practice_config(self, index: int):
+        if not self.signal_practice_configs:
+            return
+        config = self.signal_practice_configs.get(index)
+        if not config:
+            return
+        if (
+            self.practice_signal_variant != config["variant"]
+            or self.practice_signal_img_my is not config["my"]
+            or self.practice_signal_img_left is not config["left"]
+            or self.practice_signal_img_right is not config["right"]
+        ):
+            self._apply_signal_practice_config(index)
+
+    def _signal_practice_ready(self) -> bool:
+        return time.time() >= self.practice_signal_delay_until
 
     def _ensure_signal_assets(self):
         if self.signal_assets_loaded:
@@ -108,6 +172,8 @@ class IntroOverlay:
             right_snd_path = os.path.join(base_dir, "source", "right.mp3")
             false_snd_path = os.path.join(base_dir, "source", "false.mp3")
             wrong_snd_path = os.path.join(base_dir, "source", "wrong.mp3")
+            agent_my_snd_path = os.path.join(base_dir, "source", "agent_mysound.mp3")
+            agent_your_snd_path = os.path.join(base_dir, "source", "agent_yoursound.mp3")
             try:
                 self.signal_img_passown = pg.image.load(passown_path).convert_alpha()
             except Exception:
@@ -152,6 +218,14 @@ class IntroOverlay:
                 self.signal_snd_wrong = pg.mixer.Sound(wrong_snd_path)
             except Exception:
                 self.signal_snd_wrong = None
+            try:
+                self.signal_snd_agent_my = pg.mixer.Sound(agent_my_snd_path)
+            except Exception:
+                self.signal_snd_agent_my = None
+            try:
+                self.signal_snd_agent_your = pg.mixer.Sound(agent_your_snd_path)
+            except Exception:
+                self.signal_snd_agent_your = None
         except Exception:
             self.signal_img_passown = None
             self.signal_img_passyour = None
@@ -160,6 +234,8 @@ class IntroOverlay:
             self.signal_snd_right = None
             self.signal_snd_false = None
             self.signal_snd_wrong = None
+            self.signal_snd_agent_my = None
+            self.signal_snd_agent_your = None
 
     def _ensure_practice_sound(self):
         if self.practice_sound_loaded:
@@ -204,24 +280,24 @@ class IntroOverlay:
             if event.key == pg.K_b:
                 self.next()
                 return "nav"
-            if self.index == 3 and event.key == pg.K_c:
+            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.key == pg.K_c:
                 self.practice_signal_left_right()
                 return "practice"
-            if self.index == 3 and event.key == pg.K_v:
+            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.key == pg.K_v:
                 self.practice_signal_my()
                 return "practice"
         if event.type == pg.JOYBUTTONDOWN:
             if event.button == 0:
                 self.practice_shoot()
                 return "practice"
-            if self.index == 3 and event.button == 3:
+            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.button == 3:
                 self._handle_signal_input("Y")
                 return "practice"
-            if self.index == 3 and event.button in (7, 5):
+            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.button in (7, 5):
                 self._handle_signal_input("TR")
                 return "practice"
         if event.type == pg.JOYAXISMOTION:
-            if self.index == 3 and event.axis in (5, 3):
+            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.axis in (5, 3):
                 if event.value > 0.6 and not self.rt_axis_latched:
                     self.rt_axis_latched = True
                     self._handle_signal_input("TR")
@@ -246,9 +322,11 @@ class IntroOverlay:
     def update(self, dt, joystick, screen_w, screen_h):
         if not self.practice_enabled:
             return
-        if self.index == 3 and self.practice_signal_variant not in ("H", "A"):
+        if self._is_signal_practice_index(self.index):
+            self._maybe_apply_signal_practice_config(self.index)
+        if self._is_signal_practice_index(self.index) and self.practice_signal_variant not in ("H", "A"):
             return
-        if self.index not in (2, 3):
+        if self.index != 2 and not self._is_signal_practice_index(self.index):
             return
         self.last_screen_w = screen_w
         self.last_screen_h = screen_h
@@ -261,22 +339,19 @@ class IntroOverlay:
                 self.practice_cross_pos = None
                 self.practice_target_pos = None
                 self.practice_target_vel = None
-            if self.index == 3:
-                self.practice_signal_count = 0
-                self.practice_signal_prompt = None
-                self.practice_signal_expected = None
-                self.practice_signal_next_time = 0.0
-                self.practice_signal_feedback_img = None
-                self.practice_signal_feedback_until = 0.0
+            if self._is_signal_practice_index(self.index):
+                self._apply_signal_practice_config(self.index)
+                self.practice_signal_delay_until = time.time() + 1.0
         self.last_index = self.index
 
         if self.practice_cross_pos is None:
             self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.bottom]
 
-        if self.index == 3 and self.practice_signal_variant in ("H", "A"):
+        if self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A"):
             self._ensure_signal_assets()
             self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.bottom - 20]
-            self._update_signal_practice()
+            if self._signal_practice_ready():
+                self._update_signal_practice()
             if self.practice_signal_count >= self.practice_signal_goal:
                 self.next()
             return
@@ -364,13 +439,13 @@ class IntroOverlay:
                 pass
 
     def practice_signal_my(self):
-        if self.index != 3:
+        if not self._is_signal_practice_index(self.index):
             return
         self.practice_signal_img = self.practice_signal_img_my
         self.practice_signal_until = time.time() + 0.8
 
     def practice_signal_left_right(self):
-        if self.index != 3 or not self.practice_cross_pos:
+        if not self._is_signal_practice_index(self.index) or not self.practice_cross_pos:
             return
         center_x = self.practice_rect.centerx
         if self.practice_cross_pos[0] < center_x:
@@ -446,17 +521,18 @@ class IntroOverlay:
             hits_rect = hits_surf.get_rect()
             hits_rect.midbottom = (self.practice_rect.right - 50, self.practice_rect.top - 6)
             surface.blit(hits_surf, hits_rect)
-        if self.practice_enabled and self.practice_rect.width > 0 and self.index == 3 and self.practice_signal_variant in ("H", "A"):
+        if self.practice_enabled and self.practice_rect.width > 0 and self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A"):
             pg.draw.rect(surface, (50, 55, 70), self.practice_rect, border_radius=10)
             pg.draw.rect(surface, (120, 120, 120), self.practice_rect, 2, border_radius=10)
             split_y = int(self.practice_rect.top + self.practice_rect.height * 0.5)
-            pg.draw.line(
-                surface,
-                (120, 120, 120),
-                (self.practice_rect.left, split_y),
-                (self.practice_rect.right, split_y),
-                2,
-            )
+            if self.practice_signal_variant == "H":
+                pg.draw.line(
+                    surface,
+                    (120, 120, 120),
+                    (self.practice_rect.left, split_y),
+                    (self.practice_rect.right, split_y),
+                    2,
+                )
             hits_text = f"Hits: {self.practice_signal_count}/{self.practice_signal_goal}"
             hits_surf = font.render(hits_text, True, (40, 40, 40))
             hits_rect = hits_surf.get_rect()
@@ -518,7 +594,7 @@ class IntroOverlay:
         panel_h = int(screen_h * 0.82 * 0.8)
         self.panel_rect = pg.Rect(0, 0, panel_w, panel_h)
         self.panel_rect.center = (screen_w // 2, screen_h // 2)
-        if self.practice_enabled and (self.index == 2 or (self.index == 3 and self.practice_signal_variant in ("H", "A"))):
+        if self.practice_enabled and (self.index == 2 or (self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A"))):
             gap = 14
             size = int(min(panel_w, panel_h) * 0.55)
             size = max(180, min(size, self.panel_rect.width - gap * 2))
@@ -536,19 +612,26 @@ class IntroOverlay:
         now = time.time()
         if self.practice_signal_prompt is None and now >= self.practice_signal_next_time:
             if self.practice_signal_variant == "H":
-                if random.random() < 0.5:
+                if random.choice(["passown", "passyour"]) == "passown":
                     self.practice_signal_prompt = "passown"
                     self.practice_signal_expected = "TR"
                 else:
                     self.practice_signal_prompt = "passyour"
                     self.practice_signal_expected = "Y"
             else:
-                if random.random() < 0.5:
+                if random.choice(["my", "your"]) == "my":
                     self.practice_signal_prompt = "agent_my"
                     self.practice_signal_expected = "TR"
                 else:
                     self.practice_signal_prompt = random.choice(["agent_your_left", "agent_your_right"])
                     self.practice_signal_expected = "Y"
+                try:
+                    if self.practice_signal_prompt == "agent_my" and self.signal_snd_agent_my:
+                        self.signal_snd_agent_my.play()
+                    elif self.signal_snd_agent_your:
+                        self.signal_snd_agent_your.play()
+                except Exception:
+                    pass
             self.practice_signal_prompt_until = now + 2.0
         if self.practice_signal_prompt is not None and now > self.practice_signal_prompt_until:
             self.practice_signal_prompt = None
@@ -556,7 +639,7 @@ class IntroOverlay:
             self.practice_signal_next_time = now + 2.0
 
     def _handle_signal_input(self, key_name: str):
-        if self.index != 3 or self.practice_signal_variant not in ("H", "A"):
+        if not self._is_signal_practice_index(self.index) or self.practice_signal_variant not in ("H", "A"):
             return
         if self.practice_signal_variant == "H":
             if key_name == "TR":
@@ -597,11 +680,11 @@ class IntroOverlay:
             return
         if self.practice_signal_prompt is None:
             return
-        top_center = (
-            self.practice_rect.centerx,
-            self.practice_rect.top + (split_y - self.practice_rect.top) * 0.5,
-        )
         if self.practice_signal_variant == "H":
+            top_center = (
+                self.practice_rect.centerx,
+                self.practice_rect.top + (split_y - self.practice_rect.top) * 0.5,
+            )
             if self.practice_signal_prompt == "passown":
                 img = self.signal_img_passown
             else:
@@ -611,6 +694,7 @@ class IntroOverlay:
                 rect = half.get_rect(center=top_center)
                 surface.blit(half, rect)
         else:
+            top_center = self.practice_rect.center
             if self.practice_signal_prompt == "agent_my":
                 img = self.practice_signal_img_my
             elif self.practice_signal_prompt == "agent_your_left":
