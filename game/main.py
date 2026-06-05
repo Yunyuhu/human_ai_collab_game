@@ -26,7 +26,7 @@ BLACK = (0, 0, 0)
 GRAY = (80, 80, 80)
 LIGHT_GRAY = (150, 150, 150)
 BLUE = (100, 180, 255)
-ORANGE = (255, 170, 120)
+ORANGE = (255, 220, 80)
 BG_COLOR = (10, 20, 60)
 EXPERIMENT_BG_COLOR = (10, 20, 60)
 
@@ -51,8 +51,10 @@ OVERLAP_PENALTY_SEC = 1.5         # 準心重疊造成的被動干擾時間（�
 class GameState(Enum):
     HOME = auto()
     ROUND = auto()
+    LOADING = auto()
     BREAK = auto()
     DONE = auto()
+    NOTE = auto()
 
 
 # condition 對照表：編號 -> (內部代碼, 顯示文字)
@@ -81,6 +83,48 @@ def draw_text(surface, text, font, color, pos, center=False):
     surface.blit(img, rect)
 
 
+def get_default_font_path():
+    # Prefer a font with CJK support so Chinese text renders properly.
+    candidates = [
+        "PingFang",
+        "AppleGothic",
+        "Hiragino Sans GB",
+        "Microsoft JhengHei",
+        "Heiti TC",
+        "Arial Unicode MS",
+        "SimHei",
+        "Noto Sans CJK TC",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "NotoSansCJKtc-Regular",
+        "NotoSansCJKsc-Regular",
+        "NotoSansCJKjp-Regular",
+    ]
+    for name in candidates:
+        path = pg.font.match_font(name)
+        if path and Path(path).exists():
+            return path
+
+    explicit = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/Supplemental/PingFang.ttc",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "C:/Windows/Fonts/msjh.ttc",
+        "C:/Windows/Fonts/msjhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/mingliu.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJKtc-Regular.otf",
+    ]
+    for path in explicit:
+        if Path(path).exists():
+            return path
+
+    return None
+
+
 class Game:
     def __init__(self):
         pg.init()
@@ -97,10 +141,17 @@ class Game:
         self.clock = pg.time.Clock()
 
         # 字型
-        self.font_large = pg.font.SysFont("arial", 40)
-        self.font_medium = pg.font.SysFont("arial", 28)
-        self.font_small = pg.font.SysFont("arial", 22)
-        self.font_tiny = pg.font.SysFont("arial", 18)
+        font_path = get_default_font_path()
+        if font_path:
+            self.font_large = pg.font.Font(font_path, 40)
+            self.font_medium = pg.font.Font(font_path, 28)
+            self.font_small = pg.font.Font(font_path, 22)
+            self.font_tiny = pg.font.Font(font_path, 18)
+        else:
+            self.font_large = pg.font.SysFont(["AppleGothic", "PingFang", "Arial Unicode MS", "SimHei", "Noto Sans CJK TC", "Arial"], 40)
+            self.font_medium = pg.font.SysFont(["AppleGothic", "PingFang", "Arial Unicode MS", "SimHei", "Noto Sans CJK TC", "Arial"], 28)
+            self.font_small = pg.font.SysFont(["AppleGothic", "PingFang", "Arial Unicode MS", "SimHei", "Noto Sans CJK TC", "Arial"], 22)
+            self.font_tiny = pg.font.SysFont(["AppleGothic", "PingFang", "Arial Unicode MS", "SimHei", "Noto Sans CJK TC", "Arial"], 18)
 
         # 路徑 / 音效
         self.base_dir = Path(__file__).resolve().parent
@@ -118,6 +169,15 @@ class Game:
         self.voice_model_path = self.base_dir / "models" / "vosk-model-small-cn-0.3"
         self.init_voice_listener()
         self.show_intro = False
+        self.loading_start_time = None
+        self.loading_duration = 5.0
+        self.loading_complete = False
+        self.loading_button_rect = None
+        self.experimenter_notes = ""
+        self.note_active = False
+        self.notes_input_rect = None
+        self.done_note_button_rect = None
+        self.note_submit_rect = None
 
         # 載入兩個準心圖（human_crosshair.png, ai_crosshair.png）並依 scale_factor 縮放
         self.human_cross_img = None
@@ -321,7 +381,7 @@ class Game:
 
     def reset_round_objects(self):
         """重置目標與準心等物件"""
-        self.reset_ball_random()
+        self.reset_flight_random()
         # 固定左右位置
         left_x = max(20, int(WIDTH * 0.25))
         right_x = min(WIDTH - 20, int(WIDTH * 0.75))
@@ -350,6 +410,8 @@ class Game:
         self.ai_aggressive_boost_until = 0.0
         self.human_my_block_until = 0.0
         self.ai_passive_until = 0.0
+        # Agent speed modes
+        self.agent_normal_speed = 2.0
         self.hide_mode_ui = False
         self.agent_close_shot_time = None
         self.agent_close_shot_due = None
@@ -435,8 +497,13 @@ class Game:
                 if result == "close":
                     self.show_intro = False
                     self.end_info_pause()
-                    if self.pending_start or self.state == GameState.ROUND:
-                        self.start_countdown(3)
+                    if self.pending_start or self.state in (GameState.ROUND, GameState.LOADING):
+                        if self.state == GameState.LOADING:
+                            self.pending_start = False
+                            # Keep the loading page active and let the participant press the button to import the agent.
+                            self.loading_start_time = None
+                        else:
+                            self.start_countdown(3)
                 if result:
                     continue
             if getattr(self, "pause_overlay_active", False):
@@ -451,8 +518,12 @@ class Game:
                 self.handle_events_round(event)
             elif self.state == GameState.BREAK:
                 self.handle_events_break(event)
+            elif self.state == GameState.LOADING:
+                self.handle_events_loading(event)
             elif self.state == GameState.DONE:
                 self.handle_events_done(event)
+            elif self.state == GameState.NOTE:
+                self.handle_events_note(event)
 
     def handle_events_home(self, event):
         # 首頁只保留 Start 按鈕（假設 self.start_button_rect 已建立）
@@ -919,12 +990,13 @@ class Game:
         except Exception:
             pass
 
-    def apply_agent_slow(self, now: float, duration: float = 2.0, factor: float = 0.5) -> None:
+    def apply_agent_slow(self, now: float, duration: float = 2.0, factor: float = 0.7) -> None:
         self.ai_slow_until = max(getattr(self, "ai_slow_until", 0.0), now + duration)
+        # limit how slow the agent can be; keep ai_slow_factor but clamp later
         self.ai_slow_factor = min(getattr(self, "ai_slow_factor", 1.0), factor)
 
     def maybe_send_agent_signal(self, now: float) -> None:
-        if self.signal_sent_for_ball or not self.agent_active():
+        if self.signal_sent_for_flight or not self.agent_active():
             return
         if not self.agent_signal_allowed():
             return
@@ -953,7 +1025,7 @@ class Game:
             else:
                 signal_type = None
         if signal_type:
-            self.signal_sent_for_ball = True
+            self.signal_sent_for_flight = True
             self.round_signal_sent += 1
             self.log_event("signal_sent", triggered_by="agent", signal_type=signal_type, dir_ratio=dir_ratio)
             self.trigger_agent_icon(signal_type, now)
@@ -977,16 +1049,19 @@ class Game:
         # 重置總成績
         self.total_score = 0
         self.total_errors = 0
+        self.experimenter_notes = ""
         self.start_experiment_api()
-        # 進入第一回合
+        # 進入 loading 頁面，先讓實驗者確認載入 agent
         self.reset_round_stats(start_timer=False)
-        self.state = GameState.ROUND
+        self.state = GameState.LOADING
+        self.loading_start_time = None
+        self.loading_complete = False
         print(
             f"Start experiment: user_id={self.current_user_id}, "
             f"condition={self.condition_code} ({CONDITIONS[self.condition_code][0]})"
         )
 
-    def reset_ball_random(self):
+    def reset_flight_random(self):
         # 生成一個從上方下落的目標（不反彈，水平有隨機漂移）
         import random
         if getattr(self, "round_enemies_resolved", 0) >= ENEMIES_PER_ROUND:
@@ -1008,7 +1083,7 @@ class Game:
         self.flight_x = random.uniform(zone_start, min(zone_end, right_bound))
         self.flight_y = -20
         self.flight_spawn_y = self.flight_y
-        self.signal_sent_for_ball = False
+        self.signal_sent_for_flight = False
         if self.human_cross_img_base is not None:
             self.human_cross_img = self.human_cross_img_base
         if self.ai_cross_img_base is not None:
@@ -1017,9 +1092,9 @@ class Game:
         self.ai_aim_offset_y = 0.0
         self.flight_vx = random.uniform(-1.5, 1.5)
         self.flight_vy = random.uniform(1.4, 3.0)  # 始終往下移動
-        self.clamp_ball_speed()
+        self.clamp_flight_speed()
         self.round_flight_spawn += 1
-        self.log_event("ball_spawn", triggered_by="system")
+        self.log_event("flight_spawn", triggered_by="system")
 
     def advance_or_end_round(self) -> bool:
         """處理敵機結算：達到上限則結束回合，否則生成下一隻。"""
@@ -1027,10 +1102,10 @@ class Game:
             if getattr(self, "end_round_pending_until", None) is None:
                 self.end_round_pending_until = time.time() + 1.0
             return True
-        self.reset_ball_random()
+        self.reset_flight_random()
         return False
 
-    def clamp_ball_speed(self):
+    def clamp_flight_speed(self):
         """避免速度過低或過高，控制在合理範圍。"""
         max_speed = 12
         min_speed = 2.0
@@ -1043,6 +1118,14 @@ class Game:
 
     def get_divider_y(self) -> int:
         return int(HEIGHT * 0.35)
+
+    def update_loading(self, delta: float) -> None:
+        if self.loading_start_time is None:
+            return
+        if time.time() >= self.loading_start_time + self.loading_duration:
+            self.loading_start_time = None
+            self.loading_complete = True
+            return
 
     def rotate_velocity(self, deg_min: float = 30, deg_max: float = 50) -> None:
         """將速度向量旋轉一個隨機角度（deg_min~deg_max），增加角度變化。"""
@@ -1272,15 +1355,6 @@ class Game:
                 print(f"Joystick hat {event.hat}: {event.value}")
 
     def handle_events_break(self, event):
-        if event.type == pg.KEYDOWN:
-            # 下一回合 / 結束
-            if event.key == pg.K_SPACE:
-                self.go_next_round_or_done()
-            elif event.key == pg.K_r:
-                self.restart_round()
-            elif event.key == pg.K_h:
-                self.go_home()
-
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             if self.break_home_rect and self.break_home_rect.collidepoint(event.pos):
                 self.go_home()
@@ -1293,6 +1367,49 @@ class Game:
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_h:
                 self.go_home()
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if getattr(self, "done_note_button_rect", None) and self.done_note_button_rect.collidepoint(event.pos):
+                self.state = GameState.NOTE
+                self.note_active = True
+
+    def handle_events_loading(self, event):
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if getattr(self, "loading_button_rect", None) and self.loading_button_rect.collidepoint(event.pos):
+                if self.loading_start_time is None and not self.loading_complete:
+                    self.loading_start_time = time.time()
+                    self.loading_complete = False
+                elif self.loading_complete:
+                    self.state = GameState.ROUND
+                    self.start_countdown(3)
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                self.go_home()
+
+    def handle_events_note(self, event):
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                self.state = GameState.DONE
+                self.note_active = False
+                return
+            if event.key == pg.K_RETURN:
+                self.state = GameState.DONE
+                self.note_active = False
+                return
+            if event.key == pg.K_BACKSPACE:
+                self.experimenter_notes = self.experimenter_notes[:-1]
+                return
+            if event.unicode and event.unicode.isprintable() and len(self.experimenter_notes) < 500:
+                self.experimenter_notes += event.unicode
+                return
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if getattr(self, "notes_input_rect", None) and self.notes_input_rect.collidepoint(event.pos):
+                self.note_active = True
+            elif getattr(self, "note_submit_rect", None) and self.note_submit_rect.collidepoint(event.pos):
+                self.state = GameState.DONE
+                self.note_active = False
+                return
+            else:
+                self.note_active = False
 
     def handle_events_pause(self, event):
         if event.type == pg.KEYDOWN:
@@ -1327,6 +1444,9 @@ class Game:
         self.round_start_ms = None
         self.total_score = 0
         self.total_errors = 0
+        self.experimenter_notes = ""
+        self.note_active = False
+        self.notes_input_rect = None
         print("Return to HOME")
 
     def go_next_round_or_done(self):
@@ -1391,6 +1511,8 @@ class Game:
                 return
         if self.state == GameState.ROUND:
             self.update_round(delta)
+        elif self.state == GameState.LOADING:
+            self.update_loading(delta)
 
     def update_round(self, delta):
         import random
@@ -1449,7 +1571,7 @@ class Game:
                     self.joystick_axes = []
             self.update_trigger_icons(now)
             self.process_voice_events(now)
-            self.human_x = fixed_left_x
+            self.human_x = max(20, min(WIDTH - 20, self.human_x))
             min_y = self.get_divider_y()
             self.human_y = max(min_y, min(HEIGHT - 10, self.human_y))
 
@@ -1481,40 +1603,78 @@ class Game:
         elif now < getattr(self, "ai_track_until", 0.0):
             ai_active = True
         else:
-            if dist_agent_to_ball < 220:
+            if dist_agent_to_ball < 260:
+                self.ai_track_until = now + random.uniform(1.2, 2.2)
+                ai_active = True
+            elif random.random() < 0.9:
                 self.ai_track_until = now + random.uniform(1.0, 1.8)
                 ai_active = True
-            elif random.random() < 0.75:
-                self.ai_track_until = now + random.uniform(0.8, 1.6)
-                ai_active = True
             else:
-                self.ai_idle_until = now + random.uniform(0.3, 1.0)
+                self.ai_idle_until = now + random.uniform(0.15, 0.5)
                 ai_active = False
         aggressive = now < getattr(self, "ai_aggressive_until", 0.0) and now >= getattr(
             self, "human_my_block_until", 0.0
         )
-        aggressive_boost = True
         passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
-        agent_speed = 2.0
-        if getattr(self, "agent_slow_status", False):
-            agent_speed *= 0.5
+        # choose speed based on mode: aggressive if signaled/aggressive flag or if agent is closer
+        # agent will be put into aggressive mode when ai_aggressive_until is active
+        # compute slow multiplier (narrower range so passive slow isn't too strong)
+        slow_multiplier = 1.0
+        if getattr(self, "agent_slow_status", False) or now < getattr(self, "ai_slow_until", 0.0):
+            slow_multiplier = max(0.85, getattr(self, "ai_slow_factor", 0.85))
+
+        agent_speed = self.agent_normal_speed * slow_multiplier
+        # compute aggressive multiplier from normal speed (no separate attribute)
+        aggressive_factor = 1.6
+        # if aggressive flag is active, use aggressive multiplier (respect slow_multiplier)
+        if aggressive:
+            agent_speed = self.agent_normal_speed * aggressive_factor * slow_multiplier
+        else:
+            # if agent is clearly closer to the flight than human, temporarily boost to aggressive
+            try:
+                dist_human = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
+                if dist_agent_to_ball < dist_human:
+                    # set a short aggressive window so agent behaves proactively
+                    self.ai_aggressive_until = max(getattr(self, "ai_aggressive_until", 0.0), now + 1.4)
+                    agent_speed = self.agent_normal_speed * aggressive_factor * slow_multiplier
+            except Exception:
+                pass
         flight_spawn_y = getattr(self, "flight_spawn_y", -20.0)
         flight_travel_total = max(1.0, HEIGHT - flight_spawn_y)
         flight_travel_progress = (self.flight_y - flight_spawn_y) / flight_travel_total
-        if self.agent_active() and ai_active and flight_travel_progress >= 0.15:
+        if self.agent_active() and ai_active and flight_travel_progress >= 0.05:
+            # Pursue both X and Y towards the flight. Use smoother movement and allow
+            # horizontal adjustments rather than locking agent to the right edge.
             target_x = self.flight_x
             target_y = self.flight_y
-            # 避免代理人一直衝向分割線上方，偏向維持在分割線以下的中段
+            # Prefer to stay below the divider but still allow chasing above if needed
             line_y = self.get_divider_y()
-            preferred_min_y = line_y + (HEIGHT - line_y) * 0.5
+            preferred_min_y = line_y + (HEIGHT - line_y) * 0.4
             target_y = max(target_y, preferred_min_y)
-            if self.agent_y < target_y - 6:
-                self.agent_y += agent_speed
-            elif self.agent_y > target_y + 6:
-                self.agent_y -= agent_speed
-            self.agent_x = fixed_right_x
+
+            # Horizontal pursuit: move toward target_x with capped lateral speed
+            dx = target_x - self.agent_x
+            lateral_speed = agent_speed * 0.9
+            if abs(dx) > 4:
+                move_x = max(-lateral_speed, min(lateral_speed, dx))
+                # smooth small steps
+                self.agent_x += move_x * 0.5
+
+            # Vertical pursuit: move toward target_y but avoid oscillation
+            dy = target_y - self.agent_y
+            if abs(dy) > 6:
+                move_y = max(-agent_speed, min(agent_speed, dy))
+                self.agent_y += move_y
+
+            # small randomness so agent doesn't lock perfectly and looks more natural
+            if random.random() < 0.12:
+                self.agent_x += random.uniform(-0.6, 0.6)
+                self.agent_y += random.uniform(-0.4, 0.4)
+
+            # enforce screen bounds but give some margin
+            self.agent_x = max(20, min(WIDTH - 20, self.agent_x))
             min_y = self.get_divider_y()
             self.agent_y = max(min_y, min(HEIGHT - 10, self.agent_y))
 
@@ -1530,7 +1690,7 @@ class Game:
                     self.agent_close_shot_due = now
                 if now >= self.agent_close_shot_time:
                     self.round_flight_catch = getattr(self, "round_flight_catch", 0) + 1
-                    self.log_event("ball_catch", triggered_by="agent")
+                    self.log_event("flight_catch", triggered_by="agent")
                     self.create_explosion(self.agent_x, self.agent_y, "agent", now)
                     self.last_ai_shot = now
                     self.agent_close_shot_time = None
@@ -1548,11 +1708,11 @@ class Game:
             else:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
             if dist_agent_to_ball <= ai_img_radius:
-                if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.5):
+                if now - getattr(self, "last_ai_shot", 0.0) > getattr(self, "ai_shot_cooldown", 0.35):
                     if aggressive:
-                        shot_chance = 0.85
+                        shot_chance = 0.97
                     elif passive:
-                        shot_chance = 0.75
+                        shot_chance = 0.92
                     else:
                         shot_chance = 0.9
                     if random.random() <= shot_chance:
@@ -1603,7 +1763,7 @@ class Game:
                 pass
             else:
                 self.round_errors = getattr(self, "round_errors", 0) + 1
-                self.log_event("ball_miss", triggered_by="system")
+                self.log_event("flight_miss", triggered_by="system")
                 self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
                 self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
                 try:
@@ -1681,7 +1841,7 @@ class Game:
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
-                self.log_event("ball_hit", triggered_by=owner)
+                self.log_event("flight_hit", triggered_by=owner)
                 end_round = self.advance_or_end_round()
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
             visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
@@ -1797,7 +1957,7 @@ class Game:
             if abs(b["x"] - self.flight_x) < 20 and abs(b["y"] - self.flight_y) < 20:
                 # 擊中：加分、記錄事件，重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
-                self.log_event("ball_hit", triggered_by=b.get("owner", "human"))
+                self.log_event("flight_hit", triggered_by=b.get("owner", "human"))
                 self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
                 try:
                     self.bullets.remove(b)
@@ -1816,12 +1976,16 @@ class Game:
 
         if self.state == GameState.HOME:
             self.draw_home()
+        elif self.state == GameState.LOADING:
+            self.draw_loading()
         elif self.state == GameState.ROUND:
             self.draw_round()
         elif self.state == GameState.BREAK:
             self.draw_break()
         elif self.state == GameState.DONE:
             self.draw_done()
+        elif self.state == GameState.NOTE:
+            self.draw_note_page()
 
         if getattr(self, "show_intro", False):
             self.intro_overlay.draw(self.screen, self.font_small, WIDTH, HEIGHT)
@@ -1895,6 +2059,93 @@ class Game:
             (WIDTH // 2, 620),
             center=True,
         )
+
+    def draw_loading(self):
+        draw_text(
+            self.screen,
+            "Preparing your collaborator...",
+            self.font_large,
+            WHITE,
+            (WIDTH // 2, HEIGHT // 2 - 90),
+            center=True,
+        )
+        draw_text(
+            self.screen,
+            "Agent is importing. Please wait while your teammate joins the session.",
+            self.font_medium,
+            LIGHT_GRAY,
+            (WIDTH // 2, HEIGHT // 2 - 30),
+            center=True,
+        )
+
+        if self.loading_start_time is None and not self.loading_complete:
+            self.loading_button_rect = pg.Rect(WIDTH // 2 - 140, HEIGHT // 2 + 40, 280, 56)
+            pg.draw.rect(self.screen, GRAY, self.loading_button_rect, border_radius=10)
+            draw_text(
+                self.screen,
+                "Confirm load agent",
+                self.font_medium,
+                WHITE,
+                self.loading_button_rect.center,
+                center=True,
+            )
+            draw_text(
+                self.screen,
+                "Press the button to load the agent before starting the mission.",
+                self.font_small,
+                LIGHT_GRAY,
+                (WIDTH // 2, HEIGHT // 2 + 110),
+                center=True,
+            )
+            return
+
+        if self.loading_start_time is not None and not self.loading_complete:
+            elapsed = time.time() - self.loading_start_time
+            progress = min(1.0, max(0.0, elapsed / max(1e-6, self.loading_duration)))
+            px = WIDTH // 2 - 160
+            py = HEIGHT // 2 + 40
+            pw = 320
+            ph = 24
+            pg.draw.rect(self.screen, (60, 60, 80), (px, py, pw, ph), border_radius=12)
+            pg.draw.rect(self.screen, (100, 190, 255), (px + 3, py + 3, int((pw - 6) * progress), ph - 6), border_radius=10)
+            draw_text(
+                self.screen,
+                f"Loading {int(progress * 100)}%",
+                self.font_small,
+                WHITE,
+                (WIDTH // 2, py + ph + 24),
+                center=True,
+            )
+            return
+
+        if self.loading_complete:
+            draw_text(
+                self.screen,
+                "Agent loaded successfully.",
+                self.font_medium,
+                WHITE,
+                (WIDTH // 2, HEIGHT // 2 + 30),
+                center=True,
+            )
+            self.loading_button_rect = pg.Rect(WIDTH // 2 - 140, HEIGHT // 2 + 80, 280, 56)
+            pg.draw.rect(self.screen, GRAY, self.loading_button_rect, border_radius=10)
+            draw_text(
+                self.screen,
+                "Confirm start mission",
+                self.font_medium,
+                WHITE,
+                self.loading_button_rect.center,
+                center=True,
+            )
+            draw_text(
+                self.screen,
+                "Press to begin the first round.",
+                self.font_small,
+                LIGHT_GRAY,
+                (WIDTH // 2, HEIGHT // 2 + 150),
+                center=True,
+            )
+            return
 
     def draw_round(self):
         import pygame as pg
@@ -2033,13 +2284,23 @@ class Game:
             center=True,
         )
 
+        if self.current_round in (1, 3):
+            draw_text(
+                self.screen,
+                "請呼叫實驗人員，填寫「短版動態信任量表」",
+                self.font_small,
+                ORANGE,
+                (WIDTH // 2, HEIGHT // 2 + 80),
+                center=True,
+            )
+
         # 操作按鈕
         btn_w = 200
         btn_h = 52
         gap = 18
         total_w = btn_w * 3 + gap * 2
         start_x = WIDTH // 2 - total_w // 2
-        y = HEIGHT // 2 + 90
+        y = HEIGHT // 2 + 110
         self.break_home_rect = pg.Rect(start_x, y, btn_w, btn_h)
         self.break_restart_rect = pg.Rect(start_x + btn_w + gap, y, btn_w, btn_h)
         self.break_next_rect = pg.Rect(start_x + (btn_w + gap) * 2, y, btn_w, btn_h)
@@ -2073,14 +2334,6 @@ class Game:
             center=True,
         )
 
-        draw_text(
-            self.screen,
-            "Press SPACE for Next | R to Restart | H to Home",
-            self.font_small,
-            LIGHT_GRAY,
-            (WIDTH // 2, HEIGHT - 60),
-            center=True,
-        )
 
     def draw_done(self):
         draw_text(
@@ -2110,12 +2363,84 @@ class Game:
 
         draw_text(
             self.screen,
+            "實驗結束，請呼叫實驗人員。",
+            self.font_small,
+            ORANGE,
+            (WIDTH // 2, HEIGHT // 2 + 70),
+            center=True,
+        )
+
+        draw_text(
+            self.screen,
             "Press H to return Home",
             self.font_small,
             LIGHT_GRAY,
-            (WIDTH // 2, HEIGHT // 2 + 80),
+            (WIDTH // 2, HEIGHT // 2 + 110),
             center=True,
         )
+
+        self.done_note_button_rect = pg.Rect(WIDTH // 2 - 170, HEIGHT // 2 + 130, 340, 64)
+        pg.draw.rect(self.screen, GRAY, self.done_note_button_rect, border_radius=10)
+        button_center = self.done_note_button_rect.center
+        draw_text(
+            self.screen,
+            "Call experimenter",
+            self.font_medium,
+            WHITE,
+            (button_center[0], button_center[1] - 10),
+            center=True,
+        )
+        draw_text(
+            self.screen,
+            "Write notes",
+            self.font_small,
+            WHITE,
+            (button_center[0], button_center[1] + 16),
+            center=True,
+        )
+
+    def draw_note_page(self):
+        panel = pg.Rect(0, 0, min(780, WIDTH - 80), min(520, HEIGHT - 120))
+        panel.center = (WIDTH // 2, HEIGHT // 2)
+        pg.draw.rect(self.screen, (18, 24, 36), panel, border_radius=18)
+        shadow = panel.inflate(6, 6).move(3, 3)
+        pg.draw.rect(self.screen, (10, 12, 18), shadow, border_radius=20)
+
+        title = "Experiment Notes"
+        draw_text(self.screen, title, self.font_large, WHITE, (panel.centerx, panel.top + 40), center=True)
+        sub = "請輸入備註，並讓實驗人員確認後提交。"
+        draw_text(self.screen, sub, self.font_small, LIGHT_GRAY, (panel.centerx, panel.top + 92), center=True)
+
+        input_h = 180
+        self.notes_input_rect = pg.Rect(panel.left + 40, panel.top + 130, panel.width - 80, input_h)
+        pg.draw.rect(self.screen, (30, 36, 50), self.notes_input_rect, border_radius=12)
+        pg.draw.rect(self.screen, (100, 100, 120), self.notes_input_rect, 2, border_radius=12)
+
+        note_text = self.experimenter_notes or "Type notes here..."
+        note_color = LIGHT_GRAY if not self.experimenter_notes else WHITE
+        wrapped_lines = []
+        words = note_text.split(" ")
+        line = ""
+        for word in words:
+            candidate = f"{line} {word}".strip()
+            if self.font_small.size(candidate)[0] < self.notes_input_rect.width - 24:
+                line = candidate
+            else:
+                wrapped_lines.append(line)
+                line = word
+        if line:
+            wrapped_lines.append(line)
+
+        for idx, line in enumerate(wrapped_lines[:8]):
+            y = self.notes_input_rect.top + 16 + idx * 24
+            draw_text(self.screen, line, self.font_small, note_color, (self.notes_input_rect.left + 12, y))
+
+        self.note_submit_rect = pg.Rect(panel.centerx - 100, self.notes_input_rect.bottom + 30, 200, 52)
+        pg.draw.rect(self.screen, GRAY, self.note_submit_rect, border_radius=10)
+        draw_text(self.screen, "Submit Notes", self.font_medium, WHITE, self.note_submit_rect.center, center=True)
+
+        hint = "Press ENTER to save, ESC to cancel."
+        draw_text(self.screen, hint, self.font_small, LIGHT_GRAY, (panel.centerx, self.note_submit_rect.bottom + 40), center=True)
 
     def draw_countdown(self):
         remaining = max(0, int(math.ceil(self.countdown_end_time - time.time())))

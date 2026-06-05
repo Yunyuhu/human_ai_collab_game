@@ -52,10 +52,10 @@ class RoundEnd(BaseModel):
     score: int = 0
     errors: int = 0
     collisions: int = 0
-    ball_spawn: int = 0
+    flight_spawn: int = 0
     signal_sent: int = 0
-    ball_catch: int = 0
-    ball_miss: int = 0
+    flight_catch: int = 0
+    flight_miss: int = 0
     agent_active: bool = False
     human_active: bool = False
 
@@ -66,8 +66,8 @@ class EventLog(BaseModel):
     round_id: int
     timestamp: Optional[str] = None  # ISO
     event_type: str
-    ball_x: int
-    ball_y: int
+    flight_x: int
+    flight_y: int
     human_x: int
     human_y: int
     agent_x: int
@@ -75,8 +75,8 @@ class EventLog(BaseModel):
     triggered_by: str = "NA"
     signal_type: str = "NA"
     dir_ratio: Optional[float] = None
-    ball_speed: Optional[float] = None
-    ball_angle: Optional[float] = None
+    flight_speed: Optional[float] = None
+    flight_angle: Optional[float] = None
 
 
 def now_iso() -> str:

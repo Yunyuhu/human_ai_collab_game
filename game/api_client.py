@@ -46,6 +46,10 @@ def start_experiment(user_id: int, condition: int, total_rounds: int, notes: str
         },
     )
 
+def log_event(payload: Dict[str, Any]) -> None:
+    _post("/log_event", payload)
+
+
 
 def end_experiment(user_id: int, condition: int, exp_start_time: str, exp_end_time: str, total_rounds: int, notes: str) -> None:
     _post(
@@ -84,10 +88,10 @@ def end_round(
     score: int,
     errors: int,
     collisions: int,
-    ball_spawn: int,
+    flight_spawn: int,
     signal_sent: int,
-    ball_catch: int,
-    ball_miss: int,
+    flight_catch: int,
+    flight_miss: int,
     agent_active: bool,
     human_active: bool,
 ) -> None:
@@ -102,19 +106,14 @@ def end_round(
             "score": score,
             "errors": errors,
             "collisions": collisions,
-            "ball_spawn": ball_spawn,
+            "flight_spawn": flight_spawn,
             "signal_sent": signal_sent,
-            "ball_catch": ball_catch,
-            "ball_miss": ball_miss,
+            "flight_catch": flight_catch,
+            "flight_miss": flight_miss,
             "agent_active": agent_active,
             "human_active": human_active,
         },
     )
-
-
-def log_event(payload: Dict[str, Any]) -> None:
-    _post("/log_event", payload)
-
 
 class AIClient:
     """
