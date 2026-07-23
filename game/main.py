@@ -407,7 +407,7 @@ class Game:
 
         # 射擊冷卻
         self.last_human_shot = 0.0
-        self.human_shot_cooldown = 0.1
+        self.human_shot_cooldown = 0.0
         self.last_ai_shot = 0.0
         self.ai_shot_cooldown = 1.5
         self.ai_track_until = 0.0
@@ -883,6 +883,8 @@ class Game:
     def trigger_human_icon_left_right(self):
         if not self.human_active():
             return
+        if getattr(self, "end_round_pending_until", None) is not None:
+            return
         if not self.human_signal_allowed():
             return
         now = time.time()
@@ -915,6 +917,8 @@ class Game:
 
     def trigger_human_icon_my(self):
         if not self.human_active():
+            return
+        if getattr(self, "end_round_pending_until", None) is not None:
             return
         if not self.human_signal_allowed():
             return
@@ -994,10 +998,13 @@ class Game:
     def attempt_human_shot(self):
         if not self.human_active():
             return False
-        now = time.time()
-        # 判斷是否冷卻完成
-        if now - getattr(self, "last_human_shot", 0.0) <= getattr(self, "human_shot_cooldown", 0.25):
+        if getattr(self, "end_round_pending_until", None) is not None:
             return False
+        now = time.time()
+        # 平時無射擊間隔限制；只有在友火懲罰生效期間才會受冷卻限制
+        if now < getattr(self, "human_penalty_until", 0.0):
+            if now - getattr(self, "last_human_shot", 0.0) <= getattr(self, "human_shot_cooldown", 0.0):
+                return False
         # 計算準心圖片半徑（若有圖片用圖片尺寸，否則用 explosion_radius）
         if getattr(self, "human_cross_img", None):
             img_radius = self.human_cross_img.get_width() / 2.0
@@ -1019,6 +1026,7 @@ class Game:
             dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
             if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
                 self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
+                self.round_collisions += 1
                 self.logger.total_interference += 1
                 self.log_event("interference", triggered_by="human")
 
@@ -1027,8 +1035,6 @@ class Game:
         self.create_explosion(self.human_x, self.human_y, "human", now, allow_hit=shot_in_range)
 
         return shot_in_range
-
-        return False
 
     def play_shoot_sound(self):
         try:
@@ -1547,8 +1553,7 @@ class Game:
             self.state = GameState.ROUND
             self.start_countdown(3)
         else:
-            # All rounds are done, log the final state of the experiment
-            self.end_experiment_log()
+            # 所有回合皆已完成；finish_round() 在最後一回合結束時已寫入實驗總表
             self.state = GameState.DONE
             print("Experiment DONE")
 
@@ -1623,6 +1628,18 @@ class Game:
         if getattr(self, "conflict_freeze_ms", 0) > 0:
             return
 
+        # 若已進入回合結束等待，人類與代理人都不得再有任何動作（射擊/發訊號/移動等）
+        if getattr(self, "end_round_pending_until", None) is not None:
+            if time.time() >= self.end_round_pending_until:
+                self.end_round_pending_until = None
+                self.finish_round()
+                if getattr(self, "end_game_after_round", False): # End of experiment
+                    self.state = GameState.DONE
+                    print("Experiment DONE")
+                else:
+                    self.state = GameState.BREAK
+            return
+
         now = time.time()
 
         # 處理待發送的代理人協商回應
@@ -1635,10 +1652,16 @@ class Game:
                     self.trigger_agent_icon("agent_my", now)
                     self.ai_aggressive_until = now + 3.0
                     self.agent_last_signal_type = "i_can"
+                    self.round_signal_sent += 1
+                    self.round_agent_signals += 1
+                    self.logger.agent_total_signals += 1
                 elif response_type == "your_turn":
                     self.log_event("agent_signal", triggered_by="agent", signal_type="your_turn")
                     self.trigger_agent_icon("agent_your_left", now)
                     self.agent_last_signal_type = "your_turn"
+                    self.round_signal_sent += 1
+                    self.round_agent_signals += 1
+                    self.logger.agent_total_signals += 1
                 
                 self.pending_agent_response = None # 清除已處理的回應
 
@@ -1764,9 +1787,9 @@ class Game:
                 self.agent_y += move_y
 
             # small randomness so agent doesn't lock perfectly and looks more natural
-            if random.random() < 0.05:
-                self.agent_x += random.uniform(-0.6, 0.6)
-                self.agent_y += random.uniform(-0.6, 0.6)
+            if random.random() < 0.04:
+                self.agent_x += random.uniform(-0.4, 0.4)
+                self.agent_y += random.uniform(-0.4, 0.4)
 
             # enforce screen bounds but give some margin
             self.agent_x = max(20, min(WIDTH - 20, self.agent_x))
@@ -1809,51 +1832,36 @@ class Game:
         if self.agent_active():
             self.update_agent_icon(now)
 
-        # 若已進入結束等待，優先處理結束邏輯
-        if getattr(self, "end_round_pending_until", None) is not None:
-            if time.time() >= self.end_round_pending_until:
-                self.end_round_pending_until = None
-                self.finish_round()
-                if getattr(self, "end_game_after_round", False): # End of experiment
-                    self.state = GameState.DONE
-                    print("Experiment DONE")
-                else:
-                    self.state = GameState.BREAK
-            return
-
         # 檢查目標通過底線
         flight_r = getattr(self, "flight_radius", FLIGHT_R)
         if self.flight_y - flight_r > HEIGHT:
-            if getattr(self, "end_round_pending_until", None) is not None:
-                pass
-            else:
-                self.round_errors = getattr(self, "round_errors", 0) + 1
-                self.log_event("flight_missed", triggered_by="system")
-                self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
-                self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
-                try:
-                    denied_path = self.base_dir / "source" / "denied.mp3"
-                    if hasattr(self, "audio") and getattr(self.audio, "play", None):
-                        try:
-                            if hasattr(self.audio, "snd_denied"):
-                                self.audio.play(self.audio.snd_denied)
-                            else:
-                                s = pg.mixer.Sound(str(denied_path))
-                                self.audio.play(s)
-                        except Exception:
-                            try:
-                                pg.mixer.Sound(str(denied_path)).play()
-                            except Exception:
-                                pass
-                    else:
+            self.round_errors = getattr(self, "round_errors", 0) + 1
+            self.log_event("flight_missed", triggered_by="system")
+            self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
+            self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
+            try:
+                denied_path = self.base_dir / "source" / "denied.mp3"
+                if hasattr(self, "audio") and getattr(self.audio, "play", None):
+                    try:
+                        if hasattr(self.audio, "snd_denied"):
+                            self.audio.play(self.audio.snd_denied)
+                        else:
+                            s = pg.mixer.Sound(str(denied_path))
+                            self.audio.play(s)
+                    except Exception:
                         try:
                             pg.mixer.Sound(str(denied_path)).play()
                         except Exception:
                             pass
-                except Exception:
-                    pass
-                if self.advance_or_end_round():
-                    return
+                else:
+                    try:
+                        pg.mixer.Sound(str(denied_path)).play()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if self.advance_or_end_round():
+                return
 
         # 檢查準心重疊（靠太近會造成被動干擾）
         if self.human_active() and self.agent_active() and not getattr(self, "hide_mode_ui", False):
@@ -1903,12 +1911,14 @@ class Game:
                 hit_radius *= 1.8
             if owner == "agent":
                 hit_radius = exp["r"] * 0.7
-            if allow_hit and dist <= hit_radius:
+            flight_r = getattr(self, "flight_radius", FLIGHT_R)
+            off_screen = self.flight_y - flight_r > HEIGHT
+            if allow_hit and not off_screen and dist <= hit_radius:
                 hit = True
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
                 self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
-                self.log_event("flight_hit", triggered_by=owner)
+                self.log_event("shot_hit", triggered_by=owner)
                 # 累計命中次數
                 if owner == "human":
                     self.round_human_hits += 1
@@ -1920,6 +1930,9 @@ class Game:
                 if end_round:
                     # 最後一隻敵機被擊中後立即消失，不再繼續下落顯示
                     self.flight_hidden = True
+            elif allow_hit:
+                # 有效射擊（在準心範圍內）但未命中，記錄為射擊失誤，供比較人類/代理人準確率
+                self.log_event("shot_miss", triggered_by=owner)
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
         except AttributeError:
             # 若目前沒有 flight_x/flight_y，安全忽略
@@ -1962,7 +1975,7 @@ class Game:
         # 設定 penalty 時間與延長冷卻
         if target == "human":
             self.human_penalty_until = max(getattr(self, "human_penalty_until", 0.0), now + dur)
-            self.human_shot_cooldown = max(getattr(self, "human_shot_cooldown", 0.25), dur)
+            self.human_shot_cooldown = max(getattr(self, "human_shot_cooldown", 0.1), dur)
             # human flash ms
             self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(dur * 1000))
         elif target == "agent":
