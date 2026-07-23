@@ -40,7 +40,7 @@ FLIGHT_R = 10
 # 新增協作 / 友火相關參數
 SHOOT_RANGE = 120                 # 保留備用（不直接用於內圈判定）
 INNER_SHOOT_FACTOR = 1.0 / 3.0    # 只允許在準心內圈的 1/3 開火
-EXPLOSION_VISUAL_SCALE = 1.25     # 爆炸視覺放大倍率
+EXPLOSION_VISUAL_SCALE = 0.75     # 爆炸視覺放大倍率
 VISUAL_Y_OFFSET = -2               # 視覺效果下移微調
 SIGNAL_ICON_DURATION = 0.5        # 訊號圖示顯示時間（秒）
 FRIENDLY_FIRE_RADIUS = 80         # 開火時若另一準心在此半徑內視為友火風險（像素）
@@ -407,7 +407,7 @@ class Game:
 
         # 射擊冷卻
         self.last_human_shot = 0.0
-        self.human_shot_cooldown = 0.2
+        self.human_shot_cooldown = 0.1
         self.last_ai_shot = 0.0
         self.ai_shot_cooldown = 1.5
         self.ai_track_until = 0.0
@@ -461,6 +461,7 @@ class Game:
         self.round_flight_miss = 0
         self.round_enemies_resolved = 0
         self.end_round_pending_until = None
+        self.flight_hidden = False
         self.round_human_signals = 0
         self.round_agent_signals = 0
         self.round_human_shots = 0
@@ -1146,6 +1147,7 @@ class Game:
         self.flight_x = random.uniform(zone_start, min(zone_end, right_bound))
         self.flight_y = -20
         self.flight_spawn_y = self.flight_y
+        self.flight_hidden = False
         self.pending_agent_response = None # 每隻新敵機都重置協商狀態
         self.agent_negotiation_signal_sent = False
         self.agent_last_signal_type = None # 每隻新敵機都重置協商狀態
@@ -1679,21 +1681,22 @@ class Game:
             min_y = self.get_divider_y()
             self.human_y = max(min_y, min(HEIGHT - 10, self.human_y))
 
-        # 目標下落
-        self.flight_x += self.flight_vx
-        self.flight_y += self.flight_vy
-        # 下落時加入水平隨機漂移（y 軸維持往下）
-        self.flight_x += random.uniform(-0.8, 0.8)
-        if random.random() < 0.06:
-            self.rotate_velocity(deg_min=20, deg_max=30)
-            if self.flight_vy < 0:
-                self.flight_vy = abs(self.flight_vy)
-        if self.flight_x < 20:
-            self.flight_x = 20
-            self.flight_vx = abs(self.flight_vx) * 0.6
-        if self.flight_x > WIDTH - 20:
-            self.flight_x = WIDTH - 20
-            self.flight_vx = -abs(self.flight_vx) * 0.6
+        # 目標下落（若已被消滅/隱藏則不再移動）
+        if not getattr(self, "flight_hidden", False):
+            self.flight_x += self.flight_vx
+            self.flight_y += self.flight_vy
+            # 下落時加入水平隨機漂移（y 軸維持往下）
+            self.flight_x += random.uniform(-0.8, 0.8)
+            if random.random() < 0.06:
+                self.rotate_velocity(deg_min=20, deg_max=30)
+                if self.flight_vy < 0:
+                    self.flight_vy = abs(self.flight_vy)
+            if self.flight_x < 20:
+                self.flight_x = 20
+                self.flight_vx = abs(self.flight_vx) * 0.6
+            if self.flight_x > WIDTH - 20:
+                self.flight_x = WIDTH - 20
+                self.flight_vx = -abs(self.flight_vx) * 0.6
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
@@ -1761,9 +1764,9 @@ class Game:
                 self.agent_y += move_y
 
             # small randomness so agent doesn't lock perfectly and looks more natural
-            if random.random() < 0.04:
-                self.agent_x += random.uniform(-0.4, 0.4)
-                self.agent_y += random.uniform(-0.4, 0.4)
+            if random.random() < 0.05:
+                self.agent_x += random.uniform(-0.6, 0.6)
+                self.agent_y += random.uniform(-0.6, 0.6)
 
             # enforce screen bounds but give some margin
             self.agent_x = max(20, min(WIDTH - 20, self.agent_x))
@@ -1881,7 +1884,7 @@ class Game:
                     # 記錄事件（一次即可）
                     self.log_event("interference", triggered_by="system")
 
-    def create_explosion(self, x: float, y: float, owner: str, now: float) -> None:
+    def create_explosion(self, x: float, y: float, owner: str, now: float, allow_hit: bool = True) -> None:
         """在 (x,y) 產生短暫爆炸並立即檢查命中（不產生移動子彈）"""
         if not hasattr(self, "explosions"):
             self.explosions = []
@@ -1914,6 +1917,9 @@ class Game:
                     self.round_agent_hits += 1
                     self.logger.agent_hits += 1
                 end_round = self.advance_or_end_round()
+                if end_round:
+                    # 最後一隻敵機被擊中後立即消失，不再繼續下落顯示
+                    self.flight_hidden = True
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
         except AttributeError:
             # 若目前沒有 flight_x/flight_y，安全忽略
@@ -2211,12 +2217,13 @@ class Game:
         self.draw_pause_button()
         # 上方麥克風狀態
         self.draw_mic_status()
-        # 畫下落目標
-        if getattr(self, "target_img", None):
-            rect = self.target_img.get_rect(center=(int(self.flight_x), int(self.flight_y)))
-            self.screen.blit(self.target_img, rect)
-        else:
-            pg.draw.circle(self.screen, WHITE, (int(self.flight_x), int(self.flight_y)), FLIGHT_R)
+        # 畫下落目標（若最後一隻敵機已被擊中則不再顯示）
+        if not getattr(self, "flight_hidden", False):
+            if getattr(self, "target_img", None):
+                rect = self.target_img.get_rect(center=(int(self.flight_x), int(self.flight_y)))
+                self.screen.blit(self.target_img, rect)
+            else:
+                pg.draw.circle(self.screen, WHITE, (int(self.flight_x), int(self.flight_y)), FLIGHT_R)
 
         # 人類準心（圖片或 fallback）
         if self.human_active():
