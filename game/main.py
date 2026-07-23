@@ -424,6 +424,8 @@ class Game:
         self.hide_mode_ui = False
         self.agent_close_shot_time = None
         self.agent_close_shot_due = None
+        self.agent_consecutive_shots = 0
+        self.agent_burst_cooldown_until = 0.0
         self.signal_sent_for_ball = False
         self.agent_last_signal_type = None # 記錄代理人最近的訊號意圖
         self.agent_negotiation_signal_sent = False # 代理人是否已因協商而改變過一次訊號
@@ -1787,9 +1789,9 @@ class Game:
                 self.agent_y += move_y
 
             # small randomness so agent doesn't lock perfectly and looks more natural
-            if random.random() < 0.04:
-                self.agent_x += random.uniform(-0.4, 0.4)
-                self.agent_y += random.uniform(-0.4, 0.4)
+            if random.random() < 0.05:
+                self.agent_x += random.uniform(-0.5, 0.5)
+                self.agent_y += random.uniform(-0.5, 0.5)
 
             # enforce screen bounds but give some margin
             self.agent_x = max(20, min(WIDTH - 20, self.agent_x))
@@ -1802,7 +1804,7 @@ class Game:
                 ai_img_radius = self.ai_cross_img.get_width() / 2.0
             else:
                 ai_img_radius = getattr(self, "explosion_radius", 48)
-            if dist_agent_to_ball <= ai_img_radius * 0.8:
+            if dist_agent_to_ball <= ai_img_radius * 0.8 and now >= getattr(self, "agent_burst_cooldown_until", 0.0):
                 if self.agent_close_shot_time is None:
                     self.agent_close_shot_time = now + random.uniform(0.15, 0.35)
                     self.agent_close_shot_due = now
@@ -1817,9 +1819,15 @@ class Game:
                     self.agent_close_shot_time = None
                     self.agent_close_shot_due = None
                     flight_caught = True
+                    # 限制代理人連射：同一目標最多連續射擊 3 次，超過則強制暫停
+                    self.agent_consecutive_shots = getattr(self, "agent_consecutive_shots", 0) + 1
+                    if self.agent_consecutive_shots >= 3:
+                        self.agent_consecutive_shots = 0
+                        self.agent_burst_cooldown_until = now + 1.5
             else:
                 self.agent_close_shot_time = None
                 self.agent_close_shot_due = None
+                self.agent_consecutive_shots = 0
 
         # 更新爆炸列表（移除過期）
         for e in list(self.explosions):
