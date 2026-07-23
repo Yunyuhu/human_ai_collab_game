@@ -174,6 +174,23 @@ class Game:
         self.loading_duration = 5.0
         self.loading_complete = False
         self.loading_button_rect = None
+
+        # Agent 待命確認對話（loading 完成後、進入任務前的「我準備好了」確認）
+        self.ready_check_active = False
+        self.ready_confirmed = False
+        self.ready_hold_start = None
+        self.ready_hold_qualified = False  # 後台判定：本次長按是否已達到指定秒數（不對使用者顯示）
+        self.ready_hold_duration = 2.0
+        self.ready_fail_count = 0  # 連續按壓不足秒數的次數，用來決定要顯示哪一句提示
+        self.ready_dialogue_default_text = "我是接下來與你一起完成任務的 AI 夥伴，如果你準備好了，請長按下 A 鍵並跟我說『我準備好了！』"
+        self.ready_dialogue_retry_text = "嗯？聲音有點小聲，我沒聽清楚，可以再大聲一點跟我說一次嗎？"
+        self.ready_dialogue_slow_text = "請放慢語速說得清楚一點"
+        self.ready_dialogue_text = self.ready_dialogue_default_text
+        self.ready_dialogue_start_time = None
+        self.ready_dialogue_reveal_rate = 28.0  # 每秒顯示字數（打字機效果）
+        self.ready_dialogue_thinking_duration = 0.0  # 開始打字前的「思考中」動畫時長（隨機）
+        self.agent_portrait_img = None
+        self.human_portrait_img = None
         self.experimenter_notes = ""
         self.note_active = False
         self.notes_input_rect = None
@@ -262,6 +279,46 @@ class Game:
             self.ai_cross_img = None
             self.target_img = None
             self.flight_radius = FLIGHT_R
+
+        # Agent 立繪（放在準備確認對話框左側）；若尚未提供圖檔則退回準心圖示
+        try:
+            portrait_path = self.base_dir / "source" / "agent_icon.png"
+            if portrait_path.exists():
+                img_p = pg.image.load(str(portrait_path)).convert_alpha()
+                max_dim = max(img_p.get_width(), img_p.get_height())
+                desired = 320
+                if max_dim > 0 and max_dim != desired:
+                    scale = desired / max_dim
+                    img_p = pg.transform.smoothscale(
+                        img_p,
+                        (max(1, int(img_p.get_width() * scale)), max(1, int(img_p.get_height() * scale))),
+                    )
+                self.agent_portrait_img = img_p
+            else:
+                self.agent_portrait_img = self.ai_cross_img_base
+        except Exception as e:
+            print("Failed to load agent portrait image:", e)
+            self.agent_portrait_img = self.ai_cross_img_base
+
+        # 人類圖示（放在準備確認對話框內，代表輪到人類回應）
+        try:
+            human_icon_path = self.base_dir / "source" / "human_icon.png"
+            if human_icon_path.exists():
+                img_hi = pg.image.load(str(human_icon_path)).convert_alpha()
+                max_dim = max(img_hi.get_width(), img_hi.get_height())
+                desired = 96
+                if max_dim > 0 and max_dim != desired:
+                    scale = desired / max_dim
+                    img_hi = pg.transform.smoothscale(
+                        img_hi,
+                        (max(1, int(img_hi.get_width() * scale)), max(1, int(img_hi.get_height() * scale))),
+                    )
+                self.human_portrait_img = img_hi
+            else:
+                self.human_portrait_img = self.human_cross_img_base
+        except Exception as e:
+            print("Failed to load human icon image:", e)
+            self.human_portrait_img = self.human_cross_img_base
 
         if self.intro_overlay:
             try:
@@ -394,9 +451,9 @@ class Game:
         # 固定左右位置
         left_x = max(20, int(WIDTH * 0.25))
         right_x = min(WIDTH - 20, int(WIDTH * 0.75))
-        self.human_x = left_x
+        self.human_x = right_x + 25
         self.human_y = int(HEIGHT * 0.82)
-        self.agent_x = right_x + 25
+        self.agent_x = left_x
         self.agent_y = int(HEIGHT * 0.82)
         self.hit_cooldown_ms = 0
 
@@ -480,8 +537,8 @@ class Game:
             self.round_start_iso = None
         self.reset_round_objects()
         # 確保每回合開始時，準心都回到標準的左右兩側初始位置
-        self.human_x = max(20, int(WIDTH * 0.25))
-        self.agent_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+        self.human_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+        self.agent_x = max(20, int(WIDTH * 0.25))
         self.human_y = self.agent_y = int(HEIGHT * 0.82)
 
         if self.human_cross_img_base:
@@ -1128,6 +1185,13 @@ class Game:
         self.state = GameState.LOADING
         self.loading_start_time = None
         self.loading_complete = False
+        self.ready_check_active = False
+        self.ready_confirmed = False
+        self.ready_hold_start = None
+        self.ready_hold_qualified = False
+        self.ready_fail_count = 0
+        self.ready_dialogue_text = self.ready_dialogue_default_text
+        self.ready_dialogue_start_time = None
         print(
             f"Start experiment: user_id={self.current_user_id}, "
             f"condition={self.condition_code} ({CONDITIONS[self.condition_code][0]})"
@@ -1203,13 +1267,61 @@ class Game:
     def get_divider_y(self) -> int:
         return int(HEIGHT * 0.35)
 
+    def _begin_agent_dialogue(self, text: str) -> None:
+        """設定 agent 要說的話，並在打字機顯示前先隨機播放一段「思考中」動畫。"""
+        self.ready_dialogue_text = text
+        self.ready_dialogue_start_time = time.time()
+        self.ready_dialogue_thinking_duration = random.uniform(0.8, 2.2)
+
     def update_loading(self, delta: float) -> None:
-        if self.loading_start_time is None:
+        if self.loading_start_time is not None:
+            if time.time() >= self.loading_start_time + self.loading_duration:
+                self.loading_start_time = None
+                self.loading_complete = True
+                self.ready_check_active = True
+                self.ready_confirmed = False
+                self.ready_hold_start = None
+                self._begin_agent_dialogue(self.ready_dialogue_default_text)
             return
-        if time.time() >= self.loading_start_time + self.loading_duration:
-            self.loading_start_time = None
-            self.loading_complete = True
-            return
+        if self.loading_complete and self.ready_check_active and not self.ready_confirmed:
+            self.update_ready_check()
+
+    def update_ready_check(self) -> None:
+        now = time.time()
+        keys = pg.key.get_pressed()
+        held = bool(keys[pg.K_SPACE])
+        if not held and self.joystick:
+            try:
+                held = bool(self.joystick.get_button(0))
+            except Exception:
+                held = False
+        if held:
+            if self.ready_hold_start is None:
+                self.ready_hold_start = now
+                self.ready_hold_qualified = False
+                try:
+                    if hasattr(self, "audio") and getattr(self.audio, "play", None) and getattr(self.audio, "snd_drum", None):
+                        self.audio.play(self.audio.snd_drum)
+                except Exception:
+                    pass
+            elif not self.ready_hold_qualified and now - self.ready_hold_start >= self.ready_hold_duration:
+                # 秒數達標只是後台判定，畫面仍維持錄音中，等使用者自己放開才切換
+                self.ready_hold_qualified = True
+        else:
+            if self.ready_hold_start is not None:
+                if self.ready_hold_qualified:
+                    # 放開時已達到指定秒數 -> 正式確認完成
+                    self.ready_confirmed = True
+                    self.ready_fail_count = 0
+                else:
+                    # 放開時秒數不足 -> 第一次提示大聲一點，之後再不足則提示放慢語速
+                    self.ready_fail_count = getattr(self, "ready_fail_count", 0) + 1
+                    if self.ready_fail_count <= 1:
+                        self._begin_agent_dialogue(self.ready_dialogue_retry_text)
+                    else:
+                        self._begin_agent_dialogue(self.ready_dialogue_slow_text)
+            self.ready_hold_start = None
+            self.ready_hold_qualified = False
 
     def rotate_velocity(self, deg_min: float = 30, deg_max: float = 50) -> None:
         """將速度向量旋轉一個隨機角度（deg_min~deg_max），增加角度變化。"""
@@ -1474,7 +1586,7 @@ class Game:
                 if self.loading_start_time is None and not self.loading_complete:
                     self.loading_start_time = time.time()
                     self.loading_complete = False
-                elif self.loading_complete:
+                elif self.loading_complete and self.ready_confirmed:
                     # 確保從 Loading 頁面開始時，準心也回到標準的左右兩側初始位置
                     self.human_x = max(20, int(WIDTH * 0.25))
                     self.agent_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
@@ -1564,8 +1676,8 @@ class Game:
             return
         self.reset_round_stats(start_timer=False)
         # 確保重新開始時，準心也回到標準的左右兩側初始位置
-        self.human_x = max(20, int(WIDTH * 0.25))
-        self.agent_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+        self.human_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+        self.agent_x = max(20, int(WIDTH * 0.25))
         self.human_y = self.agent_y = int(HEIGHT * 0.82)
         self.restart_pending = True
         self.state = GameState.ROUND
@@ -2182,15 +2294,123 @@ class Game:
             return
 
         if self.loading_complete:
+            self.draw_ready_check_dialogue()
+            return
+
+    def _wrap_text_cjk(self, text, font, max_width):
+        lines = []
+        current = ""
+        for ch in text:
+            if ch == "\n":
+                lines.append(current)
+                current = ""
+                continue
+            trial = current + ch
+            if font.size(trial)[0] > max_width and current:
+                lines.append(current)
+                current = ch
+            else:
+                current = trial
+        lines.append(current)
+        return lines
+
+    def _fit_icon(self, img, size):
+        """把圖片等比縮放至方框內完整顯示（不裁切），回傳新 Surface。"""
+        surf = pg.Surface((size, size), flags=pg.SRCALPHA)
+        if img:
+            iw, ih = img.get_width(), img.get_height()
+            scale = min(size / iw, size / ih)
+            draw_w, draw_h = max(1, int(iw * scale)), max(1, int(ih * scale))
+            scaled = pg.transform.smoothscale(img, (draw_w, draw_h))
+            rect = scaled.get_rect(center=(size // 2, size // 2))
+            surf.blit(scaled, rect)
+        else:
+            pg.draw.rect(surf, (200, 200, 200), (0, 0, size, size), border_radius=6)
+        return surf
+
+    def draw_ready_check_dialogue(self):
+        margin = 36
+        icon_size = 30
+        icon_gap = 14
+        panel_w = min(1080, WIDTH - 60)
+        panel_h = min(440, HEIGHT - 80)
+        panel = pg.Rect(0, 0, panel_w, panel_h)
+        panel.center = (WIDTH // 2, HEIGHT // 2)
+        pg.draw.rect(self.screen, (35, 35, 45), panel, border_radius=16)
+        pg.draw.rect(self.screen, (90, 90, 110), panel, width=2, border_radius=16)
+        bubble_color = (250, 250, 250)
+
+        # Agent 對話泡泡（左側，圖示在左邊、與泡泡同一水平，不重疊）
+        # 思考中只顯示三顆點，泡泡窄一點；開始打字後才依文字寬度放大
+        if self.ready_dialogue_start_time is None:
+            self._begin_agent_dialogue(self.ready_dialogue_text)
+        now_t = time.time()
+        elapsed = now_t - self.ready_dialogue_start_time
+        thinking_duration = getattr(self, "ready_dialogue_thinking_duration", 0.0)
+        agent_thinking = elapsed < thinking_duration
+        agent_bubble_w = 100 if agent_thinking else int(panel.width * 0.66)
+        agent_bubble = pg.Rect(
+            panel.left + margin + icon_size + icon_gap,
+            panel.top + margin,
+            agent_bubble_w,
+            76,
+        )
+        pg.draw.rect(self.screen, bubble_color, agent_bubble, border_radius=18)
+        agent_tail = [
+            (agent_bubble.left + 6, agent_bubble.centery - 8),
+            (agent_bubble.left - 10, agent_bubble.centery),
+            (agent_bubble.left + 6, agent_bubble.centery + 8),
+        ]
+        pg.draw.polygon(self.screen, bubble_color, agent_tail)
+
+        agent_icon = self._fit_icon(getattr(self, "agent_portrait_img", None), icon_size)
+        agent_icon_center = (panel.left + margin + icon_size // 2, agent_bubble.centery)
+        self.screen.blit(agent_icon, agent_icon.get_rect(center=agent_icon_center))
+
+        if agent_thinking:
+            # 思考中動畫：三顆跳動的小點，不顯示文字
+            dot_gap = 16
+            base_y = agent_bubble.centery
+            for i in range(3):
+                phase = now_t * 6 + i * 1.0
+                dy = -int(5 * abs(math.sin(phase)))
+                dot_x = agent_bubble.left + 20 + i * dot_gap
+                pg.draw.circle(self.screen, (150, 150, 160), (dot_x, base_y + dy), 4)
+        else:
+            reveal_count = int((elapsed - thinking_duration) * self.ready_dialogue_reveal_rate)
+            revealed = self.ready_dialogue_text[: max(0, reveal_count)]
+            lines = self._wrap_text_cjk(revealed, self.font_small, agent_bubble.width - 32)
+            ty = agent_bubble.top + 12
+            for line in lines[:2]:
+                draw_text(self.screen, line, self.font_small, (30, 30, 35), (agent_bubble.left + 16, ty), center=False)
+                ty += 26
+
+        # Human 對話泡泡（下方、靠右，圖示在右邊、與泡泡同一水平，不重疊）—— 只放錄音標示/效果
+        # 還沒按壓時泡泡窄、只顯示麥克風圖示；按下後只放大到剛好容納波形動畫
+        holding = getattr(self, "ready_hold_start", None) is not None
+        human_bubble_w = 130 if holding else 64
+        human_bubble = pg.Rect(
+            panel.right - margin - icon_size - icon_gap - human_bubble_w,
+            agent_bubble.bottom + 30,
+            human_bubble_w,
+            70,
+        )
+        human_icon_center = (panel.right - margin - icon_size // 2, human_bubble.centery)
+
+        # 置中下方：固定的操作說明／確認狀態
+        status_center_y = human_bubble.bottom + 40
+
+        if self.ready_confirmed:
+            # 確認完成後直接在同一畫面下方顯示按鈕，不跳回前一頁
             draw_text(
                 self.screen,
-                "Agent loaded successfully.",
-                self.font_medium,
-                WHITE,
-                (WIDTH // 2, HEIGHT // 2 + 30),
+                "收到！準備開始任務。",
+                self.font_small,
+                (210, 255, 210),
+                (WIDTH // 2, status_center_y - 6),
                 center=True,
             )
-            self.loading_button_rect = pg.Rect(WIDTH // 2 - 140, HEIGHT // 2 + 80, 280, 56)
+            self.loading_button_rect = pg.Rect(WIDTH // 2 - 140, status_center_y + 16, 280, 56)
             pg.draw.rect(self.screen, GRAY, self.loading_button_rect, border_radius=10)
             draw_text(
                 self.screen,
@@ -2200,15 +2420,58 @@ class Game:
                 self.loading_button_rect.center,
                 center=True,
             )
-            draw_text(
-                self.screen,
-                "Press to begin the first round.",
-                self.font_small,
-                LIGHT_GRAY,
-                (WIDTH // 2, HEIGHT // 2 + 150),
-                center=True,
-            )
             return
+
+        pg.draw.rect(self.screen, bubble_color, human_bubble, border_radius=18)
+        human_tail = [
+            (human_bubble.right - 6, human_bubble.centery - 8),
+            (human_bubble.right + 10, human_bubble.centery),
+            (human_bubble.right - 6, human_bubble.centery + 8),
+        ]
+        pg.draw.polygon(self.screen, bubble_color, human_tail)
+
+        human_icon = self._fit_icon(getattr(self, "human_portrait_img", None), icon_size)
+        self.screen.blit(human_icon, human_icon.get_rect(center=human_icon_center))
+
+        if holding:
+            now = time.time()
+            wave_center = (human_bubble.centerx, human_bubble.centery)
+            # 純粹表示「正在收音」的波形動畫，不透露倒數/計時進度，只出現在人類的對話泡泡內
+            bar_count = 7
+            bar_gap = 10
+            base_h = 12
+            for i in range(bar_count):
+                phase = now * 9 + i * 1.3
+                h = base_h + int(9 * abs(math.sin(phase)))
+                bx = wave_center[0] + (i - bar_count // 2) * bar_gap
+                bar_rect = pg.Rect(0, 0, 5, h)
+                bar_rect.center = (bx, wave_center[1])
+                pg.draw.rect(self.screen, (150, 70, 70), bar_rect, border_radius=3)
+        else:
+            # 尚未按壓：泡泡內顯示靜態麥克風圖示
+            mic_center = (human_bubble.centerx, human_bubble.centery)
+            mic_color = (90, 90, 100)
+            body = pg.Rect(0, 0, 10, 16)
+            body.center = mic_center
+            pg.draw.rect(self.screen, mic_color, body, border_radius=4)
+            pg.draw.line(self.screen, mic_color, (mic_center[0], mic_center[1] + 10), (mic_center[0], mic_center[1] + 15), 2)
+            pg.draw.line(
+                self.screen,
+                mic_color,
+                (mic_center[0] - 7, mic_center[1] + 15),
+                (mic_center[0] + 7, mic_center[1] + 15),
+                2,
+            )
+
+        # 操作說明固定顯示在置中下方（跟錄音泡泡分開）
+        draw_text(
+            self.screen,
+            "請長按 Xbox A 鍵，大聲說出「我準備好了！」",
+            self.font_small,
+            LIGHT_GRAY,
+            (WIDTH // 2, status_center_y),
+            center=True,
+        )
 
     def draw_round(self):
         import pygame as pg
