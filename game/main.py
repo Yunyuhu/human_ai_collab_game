@@ -1003,19 +1003,16 @@ class Game:
         else:
             img_radius = getattr(self, "explosion_radius", 48)
 
-        # 無論是否在範圍內，都先建立爆炸特效與音效，確保每次按鍵都有回饋
-        self.create_explosion(self.human_x, self.human_y, "human", now)
         self.last_human_shot = now
 
         # 只有當 ball 進入準心圖片區域，才算做一次有效的射擊
         dist_to_ball = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
-        if dist_to_ball <= img_radius * 1.1:
+        shot_in_range = dist_to_ball <= img_radius * 1.1
+
+        if shot_in_range:
             # 累計有效射擊次數
             self.round_human_shots += 1
             self.logger.human_shots += 1
-            
-            # 進行命中判定
-            self.create_explosion(self.human_x, self.human_y, "human", now)
 
             # 若另一方太靠近則會誤傷 -> 施加干擾
             dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
@@ -1023,7 +1020,13 @@ class Game:
                 self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
                 self.logger.total_interference += 1
                 self.log_event("interference", triggered_by="human")
-            return True
+
+        # 呼叫 create_explosion，傳入是否允許命中的標記
+        # 即使不在範圍內，也會產生特效和聲音
+        self.create_explosion(self.human_x, self.human_y, "human", now, allow_hit=shot_in_range)
+
+        return shot_in_range
+
         return False
 
     def play_shoot_sound(self):
@@ -1169,8 +1172,9 @@ class Game:
         if self.round_enemies_resolved >= ENEMIES_PER_ROUND:
             # 確保不會重複觸發
             if self.state == GameState.ROUND:
-                self.finish_round()
-                self.state = GameState.BREAK
+                # 增加 1 秒延遲，然後再結束回合
+                if getattr(self, "end_round_pending_until", None) is None:
+                    self.end_round_pending_until = time.time() + 1.0
             return True
         self.reset_flight_random()
         return False
@@ -1319,6 +1323,15 @@ class Game:
         human_accuracy = self.logger.human_hits / self.logger.human_shots if self.logger.human_shots > 0 else 0
         agent_accuracy = self.logger.agent_hits / self.logger.agent_shots if self.logger.agent_shots > 0 else 0
 
+        # 數據一致性檢查
+        if self.logger.human_hits > self.logger.human_shots:
+            print(
+                "[HUMAN ACCURACY ERROR - EXPERIMENT]",
+                f"user_id={self.current_user_id}, "
+                f"shots={self.logger.human_shots}, "
+                f"hits={self.logger.human_hits}"
+            )
+
         data = {
             "exp_start_time": self.exp_start_iso,
             "exp_end_time": exp_end,
@@ -1345,6 +1358,16 @@ class Game:
 
         human_acc = self.round_human_hits / self.round_human_shots if self.round_human_shots > 0 else 0
         agent_acc = self.round_agent_hits / self.round_agent_shots if self.round_agent_shots > 0 else 0
+
+        # 數據一致性檢查
+        if self.round_human_hits > self.round_human_shots:
+            print(
+                "[HUMAN ACCURACY ERROR - ROUND]",
+                f"round={self.current_round}, "
+                f"shots={self.round_human_shots}, "
+                f"hits={self.round_human_hits}, "
+                f"misses={self.round_human_shots - self.round_human_hits}"
+            )
 
         data = {
             "round_id": f"R{self.current_round}",
@@ -1877,7 +1900,7 @@ class Game:
                 hit_radius *= 1.8
             if owner == "agent":
                 hit_radius = exp["r"] * 0.7
-            if dist <= hit_radius:
+            if allow_hit and dist <= hit_radius:
                 hit = True
                 # 命中目標：加分、記錄事件、重生目標
                 self.round_score = getattr(self, "round_score", 0) + 1
@@ -1892,24 +1915,6 @@ class Game:
                     self.logger.agent_hits += 1
                 end_round = self.advance_or_end_round()
             # 視覺半徑（用於友軍誤傷判定）：exp["r"] * EXPLOSION_VISUAL_SCALE
-            visual_r = exp["r"] * EXPLOSION_VISUAL_SCALE
-            if owner == "human":
-                if self.agent_active():
-                    dist_to_agent = math.hypot(self.agent_x - x, self.agent_y - y)
-                    if dist_to_agent <= visual_r:
-                        # 友軍誤傷：閃頻並暫停
-                        self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
-                        self.ai_flash_ms = max(getattr(self, "ai_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
-                        self.logger.total_interference += 1
-                        self.log_event("interference", triggered_by="human")
-            elif owner == "agent":
-                if self.human_active():
-                    dist_to_human = math.hypot(self.human_x - x, self.human_y - y)
-                    if dist_to_human <= visual_r:
-                        self.apply_friendly_penalty("human", now, FRIENDLY_FIRE_PENALTY_SEC)
-                        self.logger.total_interference += 1
-                        self.human_flash_ms = max(getattr(self, "human_flash_ms", 0), int(FRIENDLY_FIRE_PENALTY_SEC * 1000))
-                        self.log_event("interference", triggered_by="agent")
         except AttributeError:
             # 若目前沒有 flight_x/flight_y，安全忽略
             pass
