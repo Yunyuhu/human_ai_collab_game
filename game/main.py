@@ -1817,7 +1817,8 @@ class Game:
                     self.logger.agent_total_signals += 1
                 elif response_type == "your_turn":
                     self.log_event("agent_signal", triggered_by="agent", signal_type="your_turn")
-                    self.trigger_agent_icon("agent_your_left", now)
+                    your_turn_signal = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
+                    self.trigger_agent_icon(your_turn_signal, now)
                     self.agent_last_signal_type = "your_turn"
                     self.round_signal_sent += 1
                     self.round_agent_signals += 1
