@@ -166,7 +166,7 @@ class DataLogger:
         event_data = {
             "user_id": f"{self.condition_name}_{self.user_id}",
             "round_id": f"R{round_id}",
-            "timestamp": dt.datetime.now().isoformat(),
+            "timestamp": dt.datetime.utcnow().isoformat() + "Z",
             "event_type": event_type,
             "flight_id": flight_id,
             "flight_x": int(flight_x),

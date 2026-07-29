@@ -31,7 +31,7 @@ BG_COLOR = (10, 20, 60)
 EXPERIMENT_BG_COLOR = (10, 20, 60)
 
 # 遊戲設定
-TOTAL_ROUNDS = 5
+TOTAL_ROUNDS = 6
 ENEMIES_PER_ROUND = 20
 
 PADDLE_W, PADDLE_H = 100, 20
@@ -180,7 +180,7 @@ class Game:
         self.ready_confirmed = False
         self.ready_hold_start = None
         self.ready_hold_qualified = False  # 後台判定：本次長按是否已達到指定秒數（不對使用者顯示）
-        self.ready_hold_duration = 2.0
+        self.ready_hold_duration = 1.8
         self.ready_fail_count = 0  # 連續按壓不足秒數的次數，用來決定要顯示哪一句提示
         self.ready_dialogue_default_text = "我是接下來與你一起完成任務的 AI 夥伴，如果你準備好了，請長按下 A 鍵並跟我說『我準備好了！』"
         self.ready_dialogue_retry_text = "嗯？聲音有點小聲，我沒聽清楚，可以再大聲一點跟我說一次嗎？"
@@ -189,6 +189,7 @@ class Game:
         self.ready_dialogue_start_time = None
         self.ready_dialogue_reveal_rate = 28.0  # 每秒顯示字數（打字機效果）
         self.ready_dialogue_thinking_duration = 0.0  # 開始打字前的「思考中」動畫時長（隨機）
+        self.ready_mic_level_history = []  # 長按錄音期間的真實麥克風音量記錄，驅動波形動畫
         self.agent_portrait_img = None
         self.human_portrait_img = None
         self.experimenter_notes = ""
@@ -472,6 +473,7 @@ class Game:
         self.ai_slow_until = 0.0
         self.ai_slow_factor = 1.0
         self.agent_slow_status = False
+        self.agent_fast_status = False  # 交給代理人時觸發，代理人加速
         self.ai_aggressive_until = 0.0
         self.ai_aggressive_boost_until = 0.0
         self.human_my_block_until = 0.0
@@ -954,10 +956,11 @@ class Game:
         if img is not None:
             self.human_cross_img = img
             self.human_icon_until = now + SIGNAL_ICON_DURATION
-        # 交給 agent -> 恢復原本速度
+        # 交給 agent -> 代理人加速
         self.agent_slow_status = False
         self.ai_slow_until = 0.0
-        
+        self.agent_fast_status = True
+
         # 協商邏輯：若代理人先發「交給你」，人類後發「交給你」，代理人轉為發「我可以」
         if self.agent_last_signal_type == "your_turn" and not self.agent_negotiation_signal_sent:
             # 準備一個延遲回應
@@ -987,6 +990,7 @@ class Game:
             self.human_icon_until = now + SIGNAL_ICON_DURATION
             # 交給人類 -> agent 減速
             self.agent_slow_status = True
+            self.agent_fast_status = False
             self.ai_slow_until = 0.0
             self.ai_aggressive_until = 0.0
             self.human_my_block_until = now + 2.5
@@ -1010,18 +1014,21 @@ class Game:
         img = None
         if signal_type == "agent_my":
             img = self.ai_cross_img_my
-            # 交給 agent -> 恢復原本速度
+            # 交給自己 -> agent 加速
             self.agent_slow_status = False
             self.ai_slow_until = 0.0
+            self.agent_fast_status = True
         elif signal_type == "agent_your_left":
             img = self.ai_cross_img_left
             # 交給人類 -> agent 減速
             self.agent_slow_status = True
+            self.agent_fast_status = False
             self.ai_slow_until = 0.0
         elif signal_type == "agent_your_right":
             img = self.ai_cross_img_right
             # 交給人類 -> agent 減速
             self.agent_slow_status = True
+            self.agent_fast_status = False
             self.ai_slow_until = 0.0
         if img is not None:
             self.ai_cross_img = img
@@ -1129,7 +1136,7 @@ class Game:
         if not self.agent_signal_allowed():
             return
         # 只在畫面略高於 1/2 到 2/3 高度範圍內才隨機判斷是否發送
-        if self.flight_y < HEIGHT * 0.25 or self.flight_y > HEIGHT * 2 / 3:
+        if self.flight_y < HEIGHT * 0.25 or self.flight_y > HEIGHT * 0.65:
             return
 
         # 對每隻敵機只做一次決策，無論是否發送訊號
@@ -1147,13 +1154,8 @@ class Game:
         elif dir_ratio > 0.6:
             signal_type = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
         else:
-            roll = random.random()
-            if roll < 1 / 3:
-                signal_type = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
-            elif 1 / 3 < roll < 2 / 3:
-                signal_type = "agent_my"
-            else:
-                signal_type = None
+            # 0.4~0.6 中間地帶（勝負難分）：AI 不發訊號
+            signal_type = None
         if signal_type:
             self.round_signal_sent += 1
             self.round_agent_signals += 1
@@ -1161,9 +1163,6 @@ class Game:
             self.log_event("agent_signal", triggered_by="agent", signal_type="your_turn" if "your" in signal_type else "i_can", dir_ratio=dir_ratio)
             self.agent_last_signal_type = "your_turn" if "your" in signal_type else "i_can"
             self.trigger_agent_icon(signal_type, now)
-            if signal_type == "agent_my":
-                self.agent_slow_status = True
-                self.ai_slow_until = 0.0
 
     def update_agent_dir_behavior(self, now: float) -> None:
         return
@@ -1204,6 +1203,7 @@ class Game:
             return
         if self.signal_mode in ("human_dom", "agent_dom", "negotiation"):
             self.agent_slow_status = False
+            self.agent_fast_status = False
         left_bound = 40
         right_bound = WIDTH - 40
         span = max(1.0, right_bound - left_bound)
@@ -1299,6 +1299,12 @@ class Game:
             if self.ready_hold_start is None:
                 self.ready_hold_start = now
                 self.ready_hold_qualified = False
+                self.ready_mic_level_history = []
+                if self.voice_listener:
+                    try:
+                        self.voice_listener.set_enabled(True)
+                    except Exception:
+                        pass
                 try:
                     if hasattr(self, "audio") and getattr(self.audio, "play", None) and getattr(self.audio, "snd_drum", None):
                         self.audio.play(self.audio.snd_drum)
@@ -1307,8 +1313,25 @@ class Game:
             elif not self.ready_hold_qualified and now - self.ready_hold_start >= self.ready_hold_duration:
                 # 秒數達標只是後台判定，畫面仍維持錄音中，等使用者自己放開才切換
                 self.ready_hold_qualified = True
+            # 持續記錄真實麥克風音量，供畫面上的錄音波形使用
+            level = 0.0
+            if self.voice_listener:
+                try:
+                    level = self.voice_listener.get_level()
+                except Exception:
+                    level = 0.0
+            hist = getattr(self, "ready_mic_level_history", [])
+            hist.append(level)
+            if len(hist) > 7:
+                hist = hist[-7:]
+            self.ready_mic_level_history = hist
         else:
             if self.ready_hold_start is not None:
+                if self.voice_listener:
+                    try:
+                        self.voice_listener.set_enabled(False)
+                    except Exception:
+                        pass
                 if self.ready_hold_qualified:
                     # 放開時已達到指定秒數 -> 正式確認完成
                     self.ready_confirmed = True
@@ -1416,7 +1439,13 @@ class Game:
             "agent_pos": (self.agent_x, self.agent_y),
             "flight_vel": (self.flight_vx, self.flight_vy),
         }
-        
+
+        # 若呼叫端沒有指定 dir_ratio，依當下的即時位置自動算出，讓每筆事件都有值
+        if dir_ratio is None:
+            dist_agent = math.hypot(self.flight_x - self.agent_x, self.flight_y - self.agent_y)
+            dist_human = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
+            dir_ratio = dist_agent / max(1e-6, dist_agent + dist_human)
+
         # Use the provided flight_id, or fallback to the current spawn count.
         current_flight_id = flight_id if flight_id is not None else self.round_flight_spawn
 
@@ -1588,8 +1617,8 @@ class Game:
                     self.loading_complete = False
                 elif self.loading_complete and self.ready_confirmed:
                     # 確保從 Loading 頁面開始時，準心也回到標準的左右兩側初始位置
-                    self.human_x = max(20, int(WIDTH * 0.25))
-                    self.agent_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+                    self.human_x = min(WIDTH - 20, int(WIDTH * 0.75)) + 25
+                    self.agent_x = max(20, int(WIDTH * 0.25))
                     self.human_y = self.agent_y = int(HEIGHT * 0.82)
                     self.state = GameState.ROUND
                     self.start_countdown(3)
@@ -1738,6 +1767,23 @@ class Game:
         if getattr(self, "post_conflict_guard_ms", 0) > 0:
             self.post_conflict_guard_ms = max(0, self.post_conflict_guard_ms - delta * 1000)
 
+        # 敵機下落不受人類/代理人衝突凍結影響（若已被消滅/隱藏則不再移動）
+        if not getattr(self, "flight_hidden", False):
+            self.flight_x += self.flight_vx
+            self.flight_y += self.flight_vy
+            # 下落時加入水平隨機漂移（y 軸維持往下）
+            self.flight_x += random.uniform(-0.8, 0.8)
+            if random.random() < 0.06:
+                self.rotate_velocity(deg_min=20, deg_max=30)
+                if self.flight_vy < 0:
+                    self.flight_vy = abs(self.flight_vy)
+            if self.flight_x < 20:
+                self.flight_x = 20
+                self.flight_vx = abs(self.flight_vx) * 0.6
+            if self.flight_x > WIDTH - 20:
+                self.flight_x = WIDTH - 20
+                self.flight_vx = -abs(self.flight_vx) * 0.6
+
         # 若衝突 freeze 正在進行，則略過移動/射擊行為
         if getattr(self, "conflict_freeze_ms", 0) > 0:
             return
@@ -1801,12 +1847,8 @@ class Game:
             if joy_dx or joy_dy:
                 self.human_x += joy_dx * human_speed
                 self.human_y += joy_dy * human_speed
-            if self.joystick:
-                try:
-                    if self.joystick.get_button(0):
-                        self.attempt_human_shot()
-                except Exception:
-                    pass
+            # 射擊已由 JOYBUTTONDOWN 事件處理（handle_events_round），這裡不再重複輪詢，
+            # 避免同一次按下觸發兩次 attempt_human_shot()（會導致命中音效播放兩次）
             if self.joystick:
                 try:
                     self.joystick_axes = [self.joystick.get_axis(i) for i in range(self.joystick.get_numaxes())]
@@ -1817,23 +1859,6 @@ class Game:
             self.human_x = max(20, min(WIDTH - 20, self.human_x))
             min_y = self.get_divider_y()
             self.human_y = max(min_y, min(HEIGHT - 10, self.human_y))
-
-        # 目標下落（若已被消滅/隱藏則不再移動）
-        if not getattr(self, "flight_hidden", False):
-            self.flight_x += self.flight_vx
-            self.flight_y += self.flight_vy
-            # 下落時加入水平隨機漂移（y 軸維持往下）
-            self.flight_x += random.uniform(-0.8, 0.8)
-            if random.random() < 0.06:
-                self.rotate_velocity(deg_min=20, deg_max=30)
-                if self.flight_vy < 0:
-                    self.flight_vy = abs(self.flight_vy)
-            if self.flight_x < 20:
-                self.flight_x = 20
-                self.flight_vx = abs(self.flight_vx) * 0.6
-            if self.flight_x > WIDTH - 20:
-                self.flight_x = WIDTH - 20
-                self.flight_vx = -abs(self.flight_vx) * 0.6
 
         # 代理人訊號判斷（目標接近下半區）
         if self.human_active():
@@ -1862,12 +1887,17 @@ class Game:
         passive = now < getattr(self, "ai_passive_until", 0.0) and not aggressive
         if aggressive:
             ai_active = True
+        if getattr(self, "agent_fast_status", False):
+            # 加速狀態下更積極追敵機，不會隨機進入閒置
+            ai_active = True
         # choose speed based on mode: aggressive if signaled/aggressive flag or if agent is closer
         # agent will be put into aggressive mode when ai_aggressive_until is active
-        # compute slow multiplier (narrower range so passive slow isn't too strong)
+        # compute slow/fast multiplier（減速優先於加速，避免狀態衝突時取消加速）
         slow_multiplier = 1.0
         if getattr(self, "agent_slow_status", False) or now < getattr(self, "ai_slow_until", 0.0):
             slow_multiplier = max(0.85, getattr(self, "ai_slow_factor", 0.85))
+        elif getattr(self, "agent_fast_status", False):
+            slow_multiplier = 1.15
 
         agent_speed = self.agent_normal_speed * slow_multiplier
         # compute aggressive multiplier from normal speed (no separate attribute)
@@ -1878,8 +1908,8 @@ class Game:
         flight_travel_progress = (self.flight_y - flight_spawn_y) / flight_travel_total
         if self.agent_active() and ai_active and flight_travel_progress >= 0.05:
             # Pursue both X and Y towards the flight. Use smoother movement and allow
-            # horizontal adjustments rather than locking agent to the right edge.
-            target_x = self.flight_x + 25
+            # horizontal adjustments rather than locking agent to the left edge.
+            target_x = self.flight_x - 40
             target_y = self.flight_y
             # Prefer to stay below the divider but still allow chasing above if needed
             line_y = self.get_divider_y()
@@ -2238,7 +2268,7 @@ class Game:
     def draw_loading(self):
         draw_text(
             self.screen,
-            "Preparing your collaborator...",
+            "請等待實驗人員將 AI 夥伴載入",
             self.font_large,
             WHITE,
             (WIDTH // 2, HEIGHT // 2 - 90),
@@ -2246,7 +2276,7 @@ class Game:
         )
         draw_text(
             self.screen,
-            "Agent is importing. Please wait while your teammate joins the session.",
+            "你將與 AI 夥伴一同完成接續任務",
             self.font_medium,
             LIGHT_GRAY,
             (WIDTH // 2, HEIGHT // 2 - 30),
@@ -2258,7 +2288,7 @@ class Game:
             pg.draw.rect(self.screen, GRAY, self.loading_button_rect, border_radius=10)
             draw_text(
                 self.screen,
-                "Confirm load agent",
+                "載入 AI ",
                 self.font_medium,
                 WHITE,
                 self.loading_button_rect.center,
@@ -2266,10 +2296,10 @@ class Game:
             )
             draw_text(
                 self.screen,
-                "Press the button to load the agent before starting the mission.",
+                "請確認連接線和網路是否穩定",
                 self.font_small,
                 LIGHT_GRAY,
-                (WIDTH // 2, HEIGHT // 2 + 110),
+                (WIDTH // 2, HEIGHT // 2+ 120),
                 center=True,
             )
             return
@@ -2285,7 +2315,7 @@ class Game:
             pg.draw.rect(self.screen, (100, 190, 255), (px + 3, py + 3, int((pw - 6) * progress), ph - 6), border_radius=10)
             draw_text(
                 self.screen,
-                f"Loading {int(progress * 100)}%",
+                f"載入中 {int(progress * 100)}%",
                 self.font_small,
                 WHITE,
                 (WIDTH // 2, py + ph + 24),
@@ -2348,7 +2378,14 @@ class Game:
         elapsed = now_t - self.ready_dialogue_start_time
         thinking_duration = getattr(self, "ready_dialogue_thinking_duration", 0.0)
         agent_thinking = elapsed < thinking_duration
-        agent_bubble_w = 100 if agent_thinking else int(panel.width * 0.66)
+        if agent_thinking:
+            agent_bubble_w = 100
+        else:
+            # 依實際台詞長度決定泡泡寬度，短句不用跟長句一樣寬
+            max_bubble_w = int(panel.width * 0.66)
+            min_bubble_w = 180
+            text_w = self.font_small.size(self.ready_dialogue_text)[0] + 32
+            agent_bubble_w = max(min_bubble_w, min(max_bubble_w, text_w))
         agent_bubble = pg.Rect(
             panel.left + margin + icon_size + icon_gap,
             panel.top + margin,
@@ -2414,7 +2451,7 @@ class Game:
             pg.draw.rect(self.screen, GRAY, self.loading_button_rect, border_radius=10)
             draw_text(
                 self.screen,
-                "Confirm start mission",
+                "開始任務",
                 self.font_medium,
                 WHITE,
                 self.loading_button_rect.center,
@@ -2434,15 +2471,17 @@ class Game:
         self.screen.blit(human_icon, human_icon.get_rect(center=human_icon_center))
 
         if holding:
-            now = time.time()
             wave_center = (human_bubble.centerx, human_bubble.centery)
-            # 純粹表示「正在收音」的波形動畫，不透露倒數/計時進度，只出現在人類的對話泡泡內
+            # 依真實麥克風音量驅動波形高度（不透露倒數/計時進度），只出現在人類的對話泡泡內
             bar_count = 7
             bar_gap = 10
-            base_h = 12
+            base_h = 8
+            max_extra_h = 28
+            history = getattr(self, "ready_mic_level_history", [])
+            padded = ([0.0] * max(0, bar_count - len(history))) + list(history[-bar_count:])
             for i in range(bar_count):
-                phase = now * 9 + i * 1.3
-                h = base_h + int(9 * abs(math.sin(phase)))
+                level = padded[i] if i < len(padded) else 0.0
+                h = base_h + int(max_extra_h * min(1.0, level * 4.0))
                 bx = wave_center[0] + (i - bar_count // 2) * bar_gap
                 bar_rect = pg.Rect(0, 0, 5, h)
                 bar_rect.center = (bx, wave_center[1])
@@ -2464,14 +2503,14 @@ class Game:
             )
 
         # 操作說明固定顯示在置中下方（跟錄音泡泡分開）
-        draw_text(
-            self.screen,
-            "請長按 Xbox A 鍵，大聲說出「我準備好了！」",
-            self.font_small,
-            LIGHT_GRAY,
-            (WIDTH // 2, status_center_y),
-            center=True,
-        )
+        # draw_text(
+        #     self.screen,
+        #     "請長按 Xbox A 鍵，大聲說出「我準備好了！」",
+        #     self.font_small,
+        #     LIGHT_GRAY,
+        #     (WIDTH // 2, status_center_y),
+        #     center=True,
+        # )
 
     def draw_round(self):
         import pygame as pg
@@ -2491,16 +2530,10 @@ class Game:
         line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
         line_surf.fill((180, 180, 180, 140))
         self.screen.blit(line_surf, (0, line_y - 1))
-        # 模式下拉選單（左上角）
-        self.mode_selector.draw(self.screen, GRAY, WHITE)
-        # 訊號下拉選單（模式旁）
-        self.signal_selector.draw(self.screen, GRAY, WHITE)
-        # Agent speed 下拉選單（訊號旁）
+        # 正式遊戲畫面隱藏模式/訊號下拉選單與麥克風狀態圖示
         # 右上角資訊按鈕
         self.draw_info_button()
         self.draw_pause_button()
-        # 上方麥克風狀態
-        self.draw_mic_status()
         # 畫下落目標（若最後一隻敵機已被擊中則不再顯示）
         if not getattr(self, "flight_hidden", False):
             if getattr(self, "target_img", None):
@@ -2611,7 +2644,7 @@ class Game:
             center=True,
         )
 
-        if self.current_round in (1, 3):
+        if self.current_round in (2, 4, 6):
             draw_text(
                 self.screen,
                 "請呼叫實驗人員，填寫「短版動態信任量表」",
@@ -2690,7 +2723,7 @@ class Game:
 
         draw_text(
             self.screen,
-            "實驗結束，請呼叫實驗人員。",
+            "實驗結束，請呼叫研究人員，填寫「短版動態信任量表」",
             self.font_small,
             ORANGE,
             (WIDTH // 2, HEIGHT // 2 + 70),

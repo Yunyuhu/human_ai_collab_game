@@ -59,6 +59,9 @@ class IntroOverlay:
         self.last_index = 0
         self.signal_practice_configs = {}
         self.practice_signal_delay_until = 0.0
+        self.practice_started = False  # 練習區是否已按下開始按鈕（進入頁面時先暫停/靜音）
+        self.practice_start_rect = pg.Rect(0, 0, 0, 0)
+        self.practice_countdown_start = None  # 訊號練習按下開始後的 3,2,1 倒數起始時間
 
     def _load_images(self, image_paths):
         self.images = []
@@ -273,6 +276,19 @@ class IntroOverlay:
             if self.next_rect.collidepoint(event.pos):
                 self.next()
                 return "nav"
+            if (
+                not self.practice_started
+                and self.practice_countdown_start is None
+                and self.practice_enabled
+                and (self.index == 2 or (self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A")))
+                and self.practice_start_rect.collidepoint(event.pos)
+            ):
+                if self._is_signal_practice_index(self.index):
+                    # 訊號練習按下開始後先倒數 3,2,1 才正式開始
+                    self.practice_countdown_start = time.time()
+                else:
+                    self.practice_started = True
+                return "practice"
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_x:
                 self.prev()
@@ -342,10 +358,25 @@ class IntroOverlay:
             if self._is_signal_practice_index(self.index):
                 self._apply_signal_practice_config(self.index)
                 self.practice_signal_delay_until = time.time() + 1.0
+            # 每次進入練習頁面都要先暫停/靜音，等使用者按下開始按鈕才開始
+            self.practice_started = False
+            self.practice_countdown_start = None
         self.last_index = self.index
+
+        if self.practice_countdown_start is not None:
+            elapsed = time.time() - self.practice_countdown_start
+            if elapsed >= 3.0:
+                self.practice_countdown_start = None
+                self.practice_started = True
+            else:
+                return  # 倒數 3,2,1 期間維持暫停
 
         if self.practice_cross_pos is None:
             self.practice_cross_pos = [self.practice_rect.centerx, self.practice_rect.bottom]
+
+        if not self.practice_started:
+            # 尚未按下開始按鈕：練習區維持暫停狀態，不更新、不發聲
+            return
 
         if self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A"):
             self._ensure_signal_assets()
@@ -406,7 +437,7 @@ class IntroOverlay:
             self.practice_explosions = [e for e in self.practice_explosions if now - e["t"] <= e["dur"]]
 
     def practice_shoot(self):
-        if self.index != 2 or self.practice_target_pos is None:
+        if not self.practice_started or self.index != 2 or self.practice_target_pos is None:
             return
         self._ensure_practice_sound()
         cx, cy = self.practice_cross_pos or (0.0, 0.0)
@@ -417,11 +448,12 @@ class IntroOverlay:
         else:
             cross_r = 22.0
         inner_r = cross_r * 0.35
+        now = time.time()
+        # 不論有沒有命中，射擊都要有爆炸特效（跟正式遊戲一致）
+        self.practice_explosions.append(
+            {"x": cx, "y": cy, "t": now, "dur": 0.28, "r": cross_r}
+        )
         if dist <= inner_r:
-            now = time.time()
-            self.practice_explosions.append(
-                {"x": tx, "y": ty, "t": now, "dur": 0.28, "r": cross_r}
-            )
             try:
                 if self.practice_snd_hit:
                     self.practice_snd_hit.play()
@@ -439,19 +471,18 @@ class IntroOverlay:
                 pass
 
     def practice_signal_my(self):
-        if not self._is_signal_practice_index(self.index):
+        if not self.practice_started or not self._is_signal_practice_index(self.index):
             return
         self.practice_signal_img = self.practice_signal_img_my
         self.practice_signal_until = time.time() + 0.8
 
     def practice_signal_left_right(self):
-        if not self._is_signal_practice_index(self.index) or not self.practice_cross_pos:
+        if not self.practice_started or not self._is_signal_practice_index(self.index) or not self.practice_cross_pos:
             return
-        center_x = self.practice_rect.centerx
-        if self.practice_cross_pos[0] < center_x:
-            self.practice_signal_img = self.practice_signal_img_left
-        else:
-            self.practice_signal_img = self.practice_signal_img_right
+        # 練習時隨機指向左或右，不依賴準心位置
+        self.practice_signal_img = random.choice(
+            [self.practice_signal_img_left, self.practice_signal_img_right]
+        )
         self.practice_signal_until = time.time() + 0.8
 
     def _spawn_practice_target(self):
@@ -554,6 +585,17 @@ class IntroOverlay:
             self._draw_signal_prompt(surface, font, split_y)
             self._draw_signal_feedback(surface, split_y)
 
+        if (
+            self.practice_enabled
+            and self.practice_rect.width > 0
+            and (self.index == 2 or (self._is_signal_practice_index(self.index) and self.practice_signal_variant in ("H", "A")))
+            and not self.practice_started
+        ):
+            if self.practice_countdown_start is not None:
+                self._draw_practice_countdown(surface)
+            else:
+                self._draw_practice_start_overlay(surface, font)
+
         # Close button
         self.close_rect = pg.Rect(0, 0, 28, 28)
         self.close_rect.topright = (self.panel_rect.right - 10, self.panel_rect.top + 10)
@@ -578,6 +620,35 @@ class IntroOverlay:
             text_rect = text_surf.get_rect()
             text_rect.midbottom = (self.panel_rect.centerx, self.panel_rect.bottom - 12)
             surface.blit(text_surf, text_rect)
+
+    def _draw_practice_countdown(self, surface):
+        """訊號練習按下開始後的 3,2,1 倒數畫面。"""
+        overlay = pg.Surface((self.practice_rect.width, self.practice_rect.height), flags=pg.SRCALPHA)
+        overlay.fill((15, 18, 24, 200))
+        surface.blit(overlay, self.practice_rect.topleft)
+
+        elapsed = time.time() - self.practice_countdown_start
+        count = 3 - int(elapsed)
+        count = max(1, min(3, count))
+        countdown_font = pg.font.SysFont("arial", 72, bold=True)
+        text_surf = countdown_font.render(str(count), True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=self.practice_rect.center)
+        surface.blit(text_surf, text_rect)
+
+    def _draw_practice_start_overlay(self, surface, font):
+        """練習區尚未開始：蓋上半透明遮罩 + 開始按鈕，避免動畫/音效搶在說明前面出現。"""
+        overlay = pg.Surface((self.practice_rect.width, self.practice_rect.height), flags=pg.SRCALPHA)
+        overlay.fill((15, 18, 24, 200))
+        surface.blit(overlay, self.practice_rect.topleft)
+
+        btn_w, btn_h = 168, 52
+        self.practice_start_rect = pg.Rect(0, 0, btn_w, btn_h)
+        self.practice_start_rect.center = self.practice_rect.center
+        pg.draw.rect(surface, (90, 175, 100), self.practice_start_rect, border_radius=12)
+        pg.draw.rect(surface, (230, 245, 230), self.practice_start_rect, 2, border_radius=12)
+        text_surf = font.render("開始練習", True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=self.practice_start_rect.center)
+        surface.blit(text_surf, text_rect)
 
     def _draw_nav_button(self, surface, rect, label, enabled=True):
         bg = (235, 235, 235) if enabled else (210, 210, 210)
@@ -632,20 +703,23 @@ class IntroOverlay:
                         self.signal_snd_agent_your.play()
                 except Exception:
                     pass
-            self.practice_signal_prompt_until = now + 2.0
+            self.practice_signal_prompt_until = now + 2.5
         if self.practice_signal_prompt is not None and now > self.practice_signal_prompt_until:
             self.practice_signal_prompt = None
             self.practice_signal_expected = None
-            self.practice_signal_next_time = now + 2.0
+            self.practice_signal_next_time = now + 1.5
 
     def _handle_signal_input(self, key_name: str):
-        if not self._is_signal_practice_index(self.index) or self.practice_signal_variant not in ("H", "A"):
+        if not self.practice_started or not self._is_signal_practice_index(self.index) or self.practice_signal_variant not in ("H", "A"):
             return
         if self.practice_signal_variant == "H":
             if key_name == "TR":
                 self.practice_signal_img = self.practice_signal_img_my
             elif key_name == "Y":
-                self.practice_signal_img = self.practice_signal_img_right or self.practice_signal_img_left
+                # 練習時隨機指向左或右
+                self.practice_signal_img = random.choice(
+                    [self.practice_signal_img_left, self.practice_signal_img_right]
+                )
             self.practice_signal_until = time.time() + 0.8
         if self.practice_signal_prompt is None:
             return

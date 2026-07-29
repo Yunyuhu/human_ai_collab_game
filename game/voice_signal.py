@@ -21,6 +21,8 @@ class VoiceSignalListener:
         self._last_text = ""
         self._last_text_time = 0.0
         self._last_event_time = 0.0
+        self._level = 0.0
+        self._level_lock = threading.Lock()
 
     def start(self):
         if self._thread is not None:
@@ -36,6 +38,9 @@ class VoiceSignalListener:
 
     def set_enabled(self, enabled: bool):
         self._enabled = bool(enabled)
+        if not self._enabled:
+            with self._level_lock:
+                self._level = 0.0
 
     def poll(self):
         events = []
@@ -48,6 +53,11 @@ class VoiceSignalListener:
 
     def is_active(self):
         return self._active and self._enabled
+
+    def get_level(self) -> float:
+        """回傳最近一次量到的麥克風音量，正規化到 0.0~1.0。"""
+        with self._level_lock:
+            return self._level
 
     def _run(self):
         try:
@@ -74,17 +84,19 @@ class VoiceSignalListener:
             if status:
                 return
             data = bytes(indata)
+            try:
+                from array import array
+
+                samples = array("h", data)
+                level = max(abs(s) for s in samples) if samples else 0
+                with self._level_lock:
+                    self._level = min(1.0, level / 32767.0)
+            except Exception:
+                pass
             if self._debug:
                 now = time.time()
                 if now - self._last_debug > 0.5:
-                    try:
-                        from array import array
-
-                        samples = array("h", data)
-                        level = max(abs(s) for s in samples) if samples else 0
-                        print("Mic level:", level)
-                    except Exception:
-                        pass
+                    print("Mic level:", level)
                     self._last_debug = now
             if recognizer.AcceptWaveform(data):
                 result = recognizer.Result()
