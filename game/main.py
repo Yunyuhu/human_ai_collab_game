@@ -369,7 +369,7 @@ class Game:
         # 回合內的統計
         self.round_score = 0
         self.round_errors = 0
-        self.round_collisions = 0
+        self.round_conflicts = 0
         self.round_human_signals = 0
         self.round_agent_signals = 0
         self.round_human_shots = 0
@@ -463,6 +463,25 @@ class Game:
         self.explosion_duration = 0.28
         self.explosion_radius = 48
 
+        # 發訊號後才開始監聽：每 0.5 秒記錄一次 DIR / 人類 / 代理人位置到 events.csv，
+        # 持續 5 秒，敵機被解決（命中或漏接）則提前結束
+        self.dir_sample_interval = 0.5
+        self.last_dir_sample_time = 0.0
+        self.dir_monitor_until = 0.0
+        self.agent_signal_pending = None  # 代理人偏向明確後、真正發送訊號前的延遲決定
+
+        # 人類移動速度／方向（每禎更新，供 events.csv 記錄）
+        self.human_prev_x = None
+        self.human_prev_y = None
+        self.human_move_speed = 0.0
+        self.human_move_direction = 0.0
+
+        # 代理人移動速度／方向（每禎更新，供 events.csv 記錄）
+        self.agent_prev_x = None
+        self.agent_prev_y = None
+        self.agent_move_speed = 0.0
+        self.agent_move_direction = 0.0
+
         # 射擊冷卻
         self.last_human_shot = 0.0
         self.human_shot_cooldown = 0.0
@@ -515,7 +534,7 @@ class Game:
     def reset_round_stats(self, start_timer: bool = True):
         self.round_score = 0
         self.round_errors = 0
-        self.round_collisions = 0
+        self.round_conflicts = 0
         self.round_flight_spawn = 0
         self.round_signal_sent = 0
         self.round_flight_catch = 0
@@ -549,8 +568,6 @@ class Game:
             self.ai_cross_img = self.ai_cross_img_base
         self.conflict_flash_ms = 0
         self.break_next_rect = None
-        self.break_restart_rect = None
-        self.break_home_rect = None
 
     def get_elapsed_ms(self):
         """回傳本回合已經過的毫秒數（扣掉暫停時間）"""
@@ -974,6 +991,7 @@ class Game:
         self.round_human_signals += 1
         self.logger.human_total_signals += 1
         self.log_event("human_signal", triggered_by="human", signal_type="your_turn")
+        self.dir_monitor_until = now + 5.0
         return
 
 
@@ -1008,6 +1026,7 @@ class Game:
                 pass
 
             self.log_event("human_signal", triggered_by="human", signal_type="i_can")
+            self.dir_monitor_until = now + 5.0
             return
 
     def trigger_agent_icon(self, signal_type: str, now: float) -> None:
@@ -1092,9 +1111,9 @@ class Game:
             dist_to_agent = math.hypot(self.agent_x - self.human_x, self.agent_y - self.human_y)
             if dist_to_agent <= FRIENDLY_FIRE_RADIUS:
                 self.apply_friendly_penalty("agent", now, FRIENDLY_FIRE_PENALTY_SEC)
-                self.round_collisions += 1
-                self.logger.total_interference += 1
-                self.log_event("interference", triggered_by="human")
+                self.round_conflicts += 1
+                self.logger.total_conflict += 1
+                self.log_event("conflict", triggered_by="human")
 
         # 呼叫 create_explosion，傳入是否允許命中的標記
         # 即使不在範圍內，也會產生特效和聲音
@@ -1135,34 +1154,49 @@ class Game:
             return
         if not self.agent_signal_allowed():
             return
-        # 只在畫面略高於 1/2 到 2/3 高度範圍內才隨機判斷是否發送
-        if self.flight_y < HEIGHT * 0.25 or self.flight_y > HEIGHT * 0.65:
-            return
-
-        # 對每隻敵機只做一次決策，無論是否發送訊號
-        self.signal_sent_for_flight = True
-
+        # 敵機一生成就持續計算 DIR 比率（每禎重新計算），但要到大約 1/3 高度之後
+        # 才會真正判定並隨機發送訊號，直到偏向明確離開中間地帶才發送並鎖定
         dist_agent = math.hypot(self.flight_x - self.agent_x, self.flight_y - self.agent_y)
         dist_human = math.hypot(self.flight_x - self.human_x, self.flight_y - self.human_y)
         denom = max(1e-6, dist_agent + dist_human)
         dir_ratio = dist_agent / denom
-        # jitter = random.uniform(0.85, 1.15)
-        # dir_ratio = max(0.0, min(1.0, dir_ratio * jitter))
+
+        if self.flight_y < HEIGHT / 3:
+            return
+
         signal_type = None
-        if dir_ratio < 0.4:
+        if dir_ratio < 0.45:
             signal_type = "agent_my"
-        elif dir_ratio > 0.6:
+        elif dir_ratio > 0.55:
             signal_type = "agent_your_left" if self.human_x < self.agent_x else "agent_your_right"
         else:
-            # 0.4~0.6 中間地帶（勝負難分）：AI 不發訊號
-            signal_type = None
-        if signal_type:
-            self.round_signal_sent += 1
-            self.round_agent_signals += 1
-            self.logger.agent_total_signals += 1
-            self.log_event("agent_signal", triggered_by="agent", signal_type="your_turn" if "your" in signal_type else "i_can", dir_ratio=dir_ratio)
-            self.agent_last_signal_type = "your_turn" if "your" in signal_type else "i_can"
-            self.trigger_agent_icon(signal_type, now)
+            # 0.45~0.55 中間地帶（勝負難分）：取消未發出的延遲決定，繼續監聽
+            self.agent_signal_pending = None
+            return
+
+        # 偏向明確後不立刻發送，加上提前0.3秒~延後1.0秒的隨機延遲（模擬反應時間），避免每次都太一致
+        # 注意：due 若落在過去（提前的情況），會在下一次判斷時視為已到期而立即發送
+        pending = getattr(self, "agent_signal_pending", None)
+        if pending is None or pending.get("type") != signal_type:
+            self.agent_signal_pending = {
+                "type": signal_type,
+                "due": now + random.uniform(-0.5, 0.8),
+                "dir_ratio": dir_ratio,
+            }
+            return
+        if now < pending["due"]:
+            return
+
+        # 延遲時間到，真正決定發送訊號，這隻敵機才鎖定不再重複發送
+        self.agent_signal_pending = None
+        self.signal_sent_for_flight = True
+        self.round_signal_sent += 1
+        self.round_agent_signals += 1
+        self.logger.agent_total_signals += 1
+        self.log_event("agent_signal", triggered_by="agent", signal_type="your_turn" if "your" in signal_type else "i_can", dir_ratio=dir_ratio)
+        self.agent_last_signal_type = "your_turn" if "your" in signal_type else "i_can"
+        self.trigger_agent_icon(signal_type, now)
+        self.dir_monitor_until = now + 5.0
 
     def update_agent_dir_behavior(self, now: float) -> None:
         return
@@ -1224,6 +1258,7 @@ class Game:
         self.agent_negotiation_signal_sent = False
         self.agent_last_signal_type = None # 每隻新敵機都重置協商狀態
         self.signal_sent_for_flight = False
+        self.agent_signal_pending = None
         if self.human_cross_img_base is not None:
             self.human_cross_img = self.human_cross_img_base
             self.human_icon_until = 0.0
@@ -1456,7 +1491,11 @@ class Game:
             game_state=game_state,
             triggered_by=triggered_by,
             signal_type=signal_type,
-            dir_ratio=dir_ratio
+            dir_ratio=dir_ratio,
+            human_speed=getattr(self, "human_move_speed", 0.0),
+            human_direction=getattr(self, "human_move_direction", 0.0),
+            agent_speed=getattr(self, "agent_move_speed", 0.0),
+            agent_direction=getattr(self, "agent_move_direction", 0.0),
         )
 
     def start_experiment_log(self):
@@ -1493,7 +1532,7 @@ class Game:
             "total_signals": self.logger.human_total_signals + self.logger.agent_total_signals,
             "human_total_signals": self.logger.human_total_signals,
             "agent_total_signals": self.logger.agent_total_signals,
-            "total_interference": self.logger.total_interference,
+            "total_conflict": self.logger.total_conflict,
             "total_rounds": self.current_round,
             "notes": self.experimenter_notes,
         }
@@ -1530,7 +1569,7 @@ class Game:
             "human_accuracy": round(human_acc, 3),
             "agent_accuracy": round(agent_acc, 3),
             "enemy_spawn_count": self.round_flight_spawn,
-            "interference_count": self.round_collisions,
+            "conflict_count": self.round_conflicts,
             "human_signal_count": self.round_human_signals,
             "agent_signal_count": self.round_agent_signals,
         }
@@ -1578,6 +1617,10 @@ class Game:
             # Xbox A 鍵發射（通常 button 0）
             if event.button == 0:
                 self.attempt_human_shot()
+            # Xbox B 鍵暫停（通常 button 1）
+            # if event.button == 1:
+            #     self.pause_overlay_active = True
+            #     return
             # LT/RT 有些裝置會回報為按鈕
             if event.button in (6, 4, 3):
                 self.trigger_human_icon_left_right()
@@ -1593,11 +1636,7 @@ class Game:
 
     def handle_events_break(self, event):
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
-            if self.break_home_rect and self.break_home_rect.collidepoint(event.pos):
-                self.go_home()
-            elif self.break_restart_rect and self.break_restart_rect.collidepoint(event.pos):
-                self.restart_round()
-            elif self.break_next_rect and self.break_next_rect.collidepoint(event.pos):
+            if self.break_next_rect and self.break_next_rect.collidepoint(event.pos):
                 self.go_next_round_or_done()
 
     def handle_events_done(self, event):
@@ -1757,6 +1796,39 @@ class Game:
             return
         if getattr(self, "countdown_active", False):
             return
+
+        # 記錄人類這一禎的移動速度／方向，供 events.csv 使用（跟敵機的 flight_speed/flight_angle 算法一致）
+        sample_now = time.time()
+        prev_x = getattr(self, "human_prev_x", None)
+        prev_y = getattr(self, "human_prev_y", None)
+        if prev_x is not None and delta > 0:
+            hdx = self.human_x - prev_x
+            hdy = self.human_y - prev_y
+            self.human_move_speed = math.hypot(hdx, hdy) / delta
+            if hdx or hdy:
+                self.human_move_direction = math.degrees(math.atan2(hdy, hdx))
+        self.human_prev_x = self.human_x
+        self.human_prev_y = self.human_y
+
+        # 記錄代理人這一禎的移動速度／方向，算法跟人類一致
+        agent_prev_x = getattr(self, "agent_prev_x", None)
+        agent_prev_y = getattr(self, "agent_prev_y", None)
+        if agent_prev_x is not None and delta > 0:
+            adx = self.agent_x - agent_prev_x
+            ady = self.agent_y - agent_prev_y
+            self.agent_move_speed = math.hypot(adx, ady) / delta
+            if adx or ady:
+                self.agent_move_direction = math.degrees(math.atan2(ady, adx))
+        self.agent_prev_x = self.agent_x
+        self.agent_prev_y = self.agent_y
+
+        # 訊號發送後才開始監聽：每 0.5 秒記錄一次 DIR 比率、人類與代理人位置，持續 5 秒
+        # （不受衝突凍結/回合結束等待影響，敵機被解決後會提前結束，見 create_explosion / 漏接判定）
+        if sample_now < getattr(self, "dir_monitor_until", 0.0):
+            if sample_now - getattr(self, "last_dir_sample_time", 0.0) >= self.dir_sample_interval:
+                self.last_dir_sample_time = sample_now
+                self.log_event("behavior_monitor", triggered_by="system")
+
         # 更新 freeze/flash 計時（ms）
         if getattr(self, "conflict_freeze_ms", 0) > 0:
             self.conflict_freeze_ms = max(0, self.conflict_freeze_ms - delta * 1000)
@@ -1825,6 +1897,7 @@ class Game:
                     self.logger.agent_total_signals += 1
                 
                 self.pending_agent_response = None # 清除已處理的回應
+                self.dir_monitor_until = now + 5.0
 
         # 人類準心移動（箭頭或 WASD）
         keys = pg.key.get_pressed()
@@ -1910,7 +1983,7 @@ class Game:
         if self.agent_active() and ai_active and flight_travel_progress >= 0.05:
             # Pursue both X and Y towards the flight. Use smoother movement and allow
             # horizontal adjustments rather than locking agent to the left edge.
-            target_x = self.flight_x - 40
+            target_x = self.flight_x - 20
             target_y = self.flight_y
             # Prefer to stay below the divider but still allow chasing above if needed
             line_y = self.get_divider_y()
@@ -1990,6 +2063,8 @@ class Game:
             self.log_event("flight_missed", triggered_by="system")
             self.round_flight_miss = getattr(self, "round_flight_miss", 0) + 1
             self.round_enemies_resolved = getattr(self, "round_enemies_resolved", 0) + 1
+            # 敵機消失（漏接），提前結束 DIR 監聽
+            self.dir_monitor_until = 0.0
             try:
                 denied_path = self.base_dir / "source" / "denied.mp3"
                 if hasattr(self, "audio") and getattr(self.audio, "play", None):
@@ -2038,10 +2113,10 @@ class Game:
                     # 正常第一次檢測到重疊 -> 記錄為衝突並觸發 penalty（將暫停 0.5s）
                     self.apply_friendly_penalty("human", now, OVERLAP_PENALTY_SEC)
                     self.apply_friendly_penalty("agent", now, OVERLAP_PENALTY_SEC)
-                    self.logger.total_interference += 1
-                    self.round_collisions += 1
+                    self.logger.total_conflict += 1
+                    self.round_conflicts += 1
                     # 記錄事件（一次即可）
-                    self.log_event("interference", triggered_by="system")
+                    self.log_event("conflict", triggered_by="system")
 
     def create_explosion(self, x: float, y: float, owner: str, now: float, allow_hit: bool = True) -> None:
         """在 (x,y) 產生短暫爆炸並立即檢查命中（不產生移動子彈）"""
@@ -2077,6 +2152,8 @@ class Game:
                 elif owner == "agent":
                     self.round_agent_hits += 1
                     self.logger.agent_hits += 1
+                # 敵機被擊中，提前結束 DIR 監聽
+                self.dir_monitor_until = 0.0
                 end_round = self.advance_or_end_round()
                 if end_round:
                     # 最後一隻敵機被擊中後立即消失，不再繼續下落顯示
@@ -2269,7 +2346,7 @@ class Game:
     def draw_loading(self):
         draw_text(
             self.screen,
-            "請等待實驗人員將 AI 夥伴載入",
+            "請等待研究人員將 AI 夥伴載入",
             self.font_large,
             WHITE,
             (WIDTH // 2, HEIGHT // 2 - 90),
@@ -2525,11 +2602,14 @@ class Game:
         self.info_button_rect.topright = (WIDTH - 12, 10)
         self.pause_button_rect.topright = (self.info_button_rect.left - 10, 10)
 
-        # 畫可移動範圍分界線（位於畫面高度的 0.35）
+        # 畫可移動範圍分界線（位於畫面高度的 0.35）——虛線
         line_y = self.get_divider_y()
-        # 半透明橫線
         line_surf = pg.Surface((WIDTH, 3), flags=pg.SRCALPHA)
-        line_surf.fill((180, 180, 180, 140))
+        dash_len, gap_len = 14, 10
+        dash_x = 0
+        while dash_x < WIDTH:
+            pg.draw.rect(line_surf, (180, 180, 180, 140), (dash_x, 0, dash_len, 3))
+            dash_x += dash_len + gap_len
         self.screen.blit(line_surf, (0, line_y - 1))
         # 正式遊戲畫面隱藏模式/訊號下拉選單與麥克風狀態圖示
         # 右上角資訊按鈕
@@ -2596,7 +2676,7 @@ class Game:
                 self.screen.blit(surf, (fx - radius, fy - radius))
 
         # 右下角顯示實驗統計：Score / Conflicts / Errors
-        stats_text = f"Score:+{self.round_score} | Conflicts:-{self.round_collisions} | Errors:-{self.round_errors}"
+        stats_text = f"Score:+{self.round_score} | Conflicts:-{self.round_conflicts} | Errors:-{self.round_errors}"
         stats_surf = self.font_small.render(stats_text, True, LIGHT_GRAY)
 
         # 左下角顯示 round（移除 condition）
@@ -2611,10 +2691,12 @@ class Game:
 
     def draw_break(self):
         # 回合結果畫面
-        round_label = f"Round {self.current_round}"
+        chinese_numerals = ["一", "二", "三", "四", "五", "六"]
+        round_num = self.current_round
+        round_cn = chinese_numerals[round_num - 1] if 1 <= round_num <= len(chinese_numerals) else str(round_num)
         draw_text(
             self.screen,
-            f" {round_label} completed",
+            f"第{round_cn}回合結束",
             self.font_large,
             WHITE,
             (WIDTH // 2, HEIGHT // 2 - 60),
@@ -2622,7 +2704,7 @@ class Game:
         )
         draw_text(
             self.screen,
-            f"Score: {self.round_score}   Conflicts: {self.round_collisions}   Errors: {self.round_errors}",
+            f"Score: {self.round_score}",
             self.font_medium,
             WHITE,
             (WIDTH // 2, HEIGHT // 2),
@@ -2630,62 +2712,28 @@ class Game:
         )
 
         if self.current_round < self.total_rounds:
-            msg = "Select an action to continue"
-            btn_text = "Next Round"
+            btn_text = "下一回合"
         else:
-            msg = "All rounds completed."
-            btn_text = "Finish"
-
-        draw_text(
-            self.screen,
-            msg,
-            self.font_small,
-            LIGHT_GRAY,
-            (WIDTH // 2, HEIGHT // 2 + 40),
-            center=True,
-        )
+            btn_text = "結束"
 
         if self.current_round in (2, 4, 6):
             draw_text(
                 self.screen,
-                "請呼叫實驗人員，填寫「短版動態信任量表」",
+                "請呼叫研究人員，填寫小問卷",
                 self.font_small,
                 ORANGE,
                 (WIDTH // 2, HEIGHT // 2 + 80),
                 center=True,
             )
 
-        # 操作按鈕
+        # 操作按鈕（只保留下一回合/結束）
         btn_w = 200
         btn_h = 52
-        gap = 18
-        total_w = btn_w * 3 + gap * 2
-        start_x = WIDTH // 2 - total_w // 2
         y = HEIGHT // 2 + 110
-        self.break_home_rect = pg.Rect(start_x, y, btn_w, btn_h)
-        self.break_restart_rect = pg.Rect(start_x + btn_w + gap, y, btn_w, btn_h)
-        self.break_next_rect = pg.Rect(start_x + (btn_w + gap) * 2, y, btn_w, btn_h)
+        self.break_next_rect = pg.Rect(WIDTH // 2 - btn_w // 2, y, btn_w, btn_h)
 
-        pg.draw.rect(self.screen, GRAY, self.break_home_rect, border_radius=8)
-        pg.draw.rect(self.screen, GRAY, self.break_restart_rect, border_radius=8)
         pg.draw.rect(self.screen, GRAY, self.break_next_rect, border_radius=8)
-        
-        draw_text(
-            self.screen,
-            "Home",
-            self.font_medium,
-            WHITE,
-            self.break_home_rect.center,
-            center=True,
-        )
-        draw_text(
-            self.screen,
-            "Restart",
-            self.font_medium,
-            WHITE,
-            self.break_restart_rect.center,
-            center=True,
-        )
+
         draw_text(
             self.screen,
             btn_text,
@@ -2724,7 +2772,7 @@ class Game:
 
         draw_text(
             self.screen,
-            "實驗結束，請呼叫研究人員，填寫「短版動態信任量表」",
+            "實驗結束，請呼叫研究人員，填寫小問卷",
             self.font_small,
             ORANGE,
             (WIDTH // 2, HEIGHT // 2 + 70),
@@ -2761,7 +2809,7 @@ class Game:
 
         title = "Experiment Notes"
         draw_text(self.screen, title, self.font_large, WHITE, (panel.centerx, panel.top + 40), center=True)
-        sub = "請輸入備註，並讓實驗人員確認後提交。"
+        sub = "請輸入備註，並讓研究人員確認後提交。"
         draw_text(self.screen, sub, self.font_small, LIGHT_GRAY, (panel.centerx, panel.top + 92), center=True)
 
         input_h = 180

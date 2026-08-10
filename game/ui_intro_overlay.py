@@ -289,6 +289,27 @@ class IntroOverlay:
                 else:
                     self.practice_started = True
                 return "practice"
+            if (
+                self.practice_started
+                and self._is_signal_practice_index(self.index)
+                and self.practice_signal_variant == "A"
+                and self._signal_practice_ready()
+                and self.practice_signal_prompt is not None
+            ):
+                # 代理人訊號辨識練習：左鍵 = 自己判斷回應正確
+                self._handle_signal_self_judgment(True)
+                return "practice"
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 3:
+            if (
+                self.practice_started
+                and self._is_signal_practice_index(self.index)
+                and self.practice_signal_variant == "A"
+                and self._signal_practice_ready()
+                and self.practice_signal_prompt is not None
+            ):
+                # 代理人訊號辨識練習：右鍵 = 自己判斷回應錯誤
+                self._handle_signal_self_judgment(False)
+                return "practice"
         if event.type == pg.KEYDOWN:
             if event.key == pg.K_x:
                 self.prev()
@@ -306,14 +327,15 @@ class IntroOverlay:
             if event.button == 0:
                 self.practice_shoot()
                 return "practice"
-            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.button == 3:
+            # 代理人訊號辨識練習（variant A）改用滑鼠左右鍵自我判斷，這裡只保留給 H 頁使用
+            if self._is_signal_practice_index(self.index) and self.practice_signal_variant != "A" and self._signal_practice_ready() and event.button == 3:
                 self._handle_signal_input("Y")
                 return "practice"
-            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.button in (7, 5):
+            if self._is_signal_practice_index(self.index) and self.practice_signal_variant != "A" and self._signal_practice_ready() and event.button in (7, 5):
                 self._handle_signal_input("TR")
                 return "practice"
         if event.type == pg.JOYAXISMOTION:
-            if self._is_signal_practice_index(self.index) and self._signal_practice_ready() and event.axis in (5, 3):
+            if self._is_signal_practice_index(self.index) and self.practice_signal_variant != "A" and self._signal_practice_ready() and event.axis in (5, 3):
                 if event.value > 0.6 and not self.rt_axis_latched:
                     self.rt_axis_latched = True
                     self._handle_signal_input("TR")
@@ -748,6 +770,30 @@ class IntroOverlay:
             if self.practice_signal_variant == "A":
                 self.practice_signal_feedback_img = self.signal_img_wrong
                 self.practice_signal_feedback_until = time.time() + 1.0
+
+    def _handle_signal_self_judgment(self, is_correct: bool) -> None:
+        """代理人訊號辨識練習：使用者自行判斷這次回應對或錯（滑鼠左鍵=對，右鍵=錯）。"""
+        if self.practice_signal_prompt is None:
+            return
+        if is_correct:
+            self.practice_signal_count += 1
+            try:
+                if self.signal_snd_right:
+                    self.signal_snd_right.play()
+            except Exception:
+                pass
+            self.practice_signal_feedback_img = self.signal_img_right
+        else:
+            try:
+                if self.signal_snd_wrong:
+                    self.signal_snd_wrong.play()
+            except Exception:
+                pass
+            self.practice_signal_feedback_img = self.signal_img_wrong
+        self.practice_signal_feedback_until = time.time() + 1.0
+        self.practice_signal_prompt = None
+        self.practice_signal_expected = None
+        self.practice_signal_next_time = time.time() + 1.5
 
     def _draw_signal_prompt(self, surface, font, split_y):
         if self.practice_signal_variant not in ("H", "A"):

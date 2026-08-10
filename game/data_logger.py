@@ -28,7 +28,7 @@ class DataLogger:
         self.total_signals = 0
         self.human_total_signals = 0
         self.agent_total_signals = 0
-        self.total_interference = 0
+        self.total_conflict = 0
 
     def setup_experiment(self, user_id: str, condition_name: str):
         self.user_id = user_id
@@ -49,7 +49,7 @@ class DataLogger:
             [
                 "user_id", "exp_start_time", "exp_end_time", "total_score", "total_errors",
                 "human_total_accuracy", "agent_total_accuracy", "total_signals",
-                "human_total_signals", "agent_total_signals", "total_interference",
+                "human_total_signals", "agent_total_signals", "total_conflict",
                 "total_rounds", "notes"
             ],
         )
@@ -58,7 +58,7 @@ class DataLogger:
             [
                 "user_id", "round_id", "round_start_time", "round_end_time", "round_duration",
                 "round_score", "round_errors", "human_accuracy", "agent_accuracy",
-                "enemy_spawn_count", "interference_count", "human_signal_count", "agent_signal_count"
+                "enemy_spawn_count", "conflict_count", "human_signal_count", "agent_signal_count"
             ],
         )
         self.event_header = self._init_csv(
@@ -67,13 +67,15 @@ class DataLogger:
                 "user_id", "round_id", "timestamp", "event_type", "flight_id",
                 "flight_x", "flight_y", "human_x", "human_y", "agent_x", "agent_y",
                 "dist_human_flight", "dist_agent_flight", "dist_human_agent", # dist_between is split into 3
-                "triggered_by", "signal_type", "dir_ratio", "flight_speed", "flight_angle"
+                "triggered_by", "signal_type", "dir_ratio", "flight_speed", "flight_angle",
+                "human_speed", "human_direction", "agent_speed", "agent_direction"
             ],
         )
 
     def _init_csv(self, file_path: Path, header: list[str]):
         if not file_path.exists():
             try:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(file_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(header)
@@ -90,6 +92,10 @@ class DataLogger:
             return
 
         try:
+            self.data_path.mkdir(parents=True, exist_ok=True)
+            if not file_path.exists():
+                with open(file_path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header)
             with open(file_path, "a", newline="", encoding="utf-8") as f:
                 # Create a list of values in the correct order based on the cached header
                 row = [data.get(h, "") for h in header]
@@ -129,6 +135,7 @@ class DataLogger:
         if not found:
             rows.append(data)
 
+        self.data_path.mkdir(parents=True, exist_ok=True)
         with open(self.experiment_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.experiment_header)
             writer.writeheader()
@@ -147,6 +154,10 @@ class DataLogger:
         triggered_by: str = "NA",
         signal_type: str = "NA",
         dir_ratio: Optional[float] = None,
+        human_speed: float = 0.0,
+        human_direction: float = 0.0,
+        agent_speed: float = 0.0,
+        agent_direction: float = 0.0,
     ):
         if not self.data_path:
             return
@@ -183,6 +194,10 @@ class DataLogger:
             "dir_ratio": round(dir_ratio, 3) if dir_ratio is not None else "NA",
             "flight_speed": round(flight_speed, 2),
             "flight_angle": round(flight_angle, 2),
+            "human_speed": round(human_speed, 2),
+            "human_direction": round(human_direction, 2),
+            "agent_speed": round(agent_speed, 2),
+            "agent_direction": round(agent_direction, 2),
         }
         self._append_to_csv(self.event_file, self.event_header, event_data)
 
@@ -194,4 +209,4 @@ class DataLogger:
         self.total_signals = 0
         self.human_total_signals = 0
         self.agent_total_signals = 0
-        self.total_interference = 0
+        self.total_conflict = 0
