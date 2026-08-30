@@ -492,6 +492,8 @@ class Game:
         self.ai_slow_until = 0.0
         self.ai_slow_factor = 1.0
         self.agent_slow_status = False
+        self.agent_slow_start = None  # 減速序列開始時間：先降速一段時間，再完全停止一段時間
+        self.agent_slow_phase2_duration = 1.0  # 完全停止階段的隨機時長（0.5~1 秒，觸發時重新抽）
         self.agent_fast_status = False  # 交給代理人時觸發，代理人加速
         self.ai_aggressive_until = 0.0
         self.ai_aggressive_boost_until = 0.0
@@ -975,6 +977,7 @@ class Game:
             self.human_icon_until = now + SIGNAL_ICON_DURATION
         # 交給 agent -> 代理人加速
         self.agent_slow_status = False
+        self.agent_slow_start = None
         self.ai_slow_until = 0.0
         self.agent_fast_status = True
 
@@ -1006,8 +1009,10 @@ class Game:
         if self.human_cross_img_my is not None:
             self.human_cross_img = self.human_cross_img_my
             self.human_icon_until = now + SIGNAL_ICON_DURATION
-            # 交給人類 -> agent 減速
+            # 交給人類 -> agent 減速（先降速，再完全停止一下）
             self.agent_slow_status = True
+            self.agent_slow_start = now
+            self.agent_slow_phase2_duration = random.uniform(0.5, 1.0)
             self.agent_fast_status = False
             self.ai_slow_until = 0.0
             self.ai_aggressive_until = 0.0
@@ -1035,18 +1040,23 @@ class Game:
             img = self.ai_cross_img_my
             # 交給自己 -> agent 加速
             self.agent_slow_status = False
+            self.agent_slow_start = None
             self.ai_slow_until = 0.0
             self.agent_fast_status = True
         elif signal_type == "agent_your_left":
             img = self.ai_cross_img_left
-            # 交給人類 -> agent 減速
+            # 交給人類 -> agent 減速（先降速，再完全停止一下）
             self.agent_slow_status = True
+            self.agent_slow_start = now
+            self.agent_slow_phase2_duration = random.uniform(0.5, 1.0)
             self.agent_fast_status = False
             self.ai_slow_until = 0.0
         elif signal_type == "agent_your_right":
             img = self.ai_cross_img_right
-            # 交給人類 -> agent 減速
+            # 交給人類 -> agent 減速（先降速，再完全停止一下）
             self.agent_slow_status = True
+            self.agent_slow_start = now
+            self.agent_slow_phase2_duration = random.uniform(0.5, 1.0)
             self.agent_fast_status = False
             self.ai_slow_until = 0.0
         if img is not None:
@@ -1237,6 +1247,7 @@ class Game:
             return
         if self.signal_mode in ("human_dom", "agent_dom", "negotiation"):
             self.agent_slow_status = False
+            self.agent_slow_start = None
             self.agent_fast_status = False
         left_bound = 40
         right_bound = WIDTH - 40
@@ -1967,11 +1978,26 @@ class Game:
         # choose speed based on mode: aggressive if signaled/aggressive flag or if agent is closer
         # agent will be put into aggressive mode when ai_aggressive_until is active
         # compute slow/fast multiplier（減速優先於加速，避免狀態衝突時取消加速）
+        # 減速分兩階段：先降到 75% 速度 0.75 秒，接著完全停止 0.5~1 秒（隨機），之後序列結束、恢復正常
+        SLOW_PHASE1_DURATION = 0.75
+        SLOW_PHASE1_MULTIPLIER = 0.75
+        FAST_MULTIPLIER = 1.3
+
         slow_multiplier = 1.0
-        if getattr(self, "agent_slow_status", False) or now < getattr(self, "ai_slow_until", 0.0):
-            slow_multiplier = max(0.85, getattr(self, "ai_slow_factor", 0.85))
+        if getattr(self, "agent_slow_status", False) and getattr(self, "agent_slow_start", None) is not None:
+            slow_elapsed = now - self.agent_slow_start
+            slow_phase2_duration = getattr(self, "agent_slow_phase2_duration", 1.0)
+            if slow_elapsed < SLOW_PHASE1_DURATION:
+                slow_multiplier = SLOW_PHASE1_MULTIPLIER
+            elif slow_elapsed < SLOW_PHASE1_DURATION + slow_phase2_duration:
+                slow_multiplier = 0.0
+            else:
+                # 減速序列結束，恢復正常
+                self.agent_slow_status = False
+                self.agent_slow_start = None
+                slow_multiplier = 1.0
         elif getattr(self, "agent_fast_status", False):
-            slow_multiplier = 1.15
+            slow_multiplier = FAST_MULTIPLIER
 
         agent_speed = self.agent_normal_speed * slow_multiplier
         # compute aggressive multiplier from normal speed (no separate attribute)

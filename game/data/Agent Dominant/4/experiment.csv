@@ -1,0 +1,2 @@
+user_id,exp_start_time,exp_end_time,total_score,total_errors,human_total_accuracy,agent_total_accuracy,total_signals,human_total_signals,agent_total_signals,total_conflict,total_rounds,notes
+Agent Dominant_4,2026-08-13T11:59:13.181743Z,2026-08-13T12:32:28.779481Z,87,33,0.167,0.551,118,0,118,6,6,

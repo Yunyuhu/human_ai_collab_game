@@ -1,0 +1,7 @@
+user_id,round_id,round_start_time,round_end_time,round_duration,round_score,round_errors,human_accuracy,agent_accuracy,enemy_spawn_count,conflict_count,human_signal_count,agent_signal_count
+Human Dominant_9,R1,2026-08-23T11:43:11.397245Z,2026-08-23T11:45:04.343121Z,112.95,18,2,0.571,0.769,20,2,18,0
+Human Dominant_9,R2,2026-08-23T11:45:10.298020Z,2026-08-23T11:47:25.829402Z,135.53,16,4,0.467,0.6,20,2,43,0
+Human Dominant_9,R3,2026-08-23T11:50:14.918726Z,2026-08-23T11:52:32.503139Z,137.58,17,3,0.316,0.579,20,4,43,0
+Human Dominant_9,R4,2026-08-23T11:52:37.265127Z,2026-08-23T11:54:38.206608Z,120.94,14,6,0.2,0.562,20,0,45,0
+Human Dominant_9,R5,2026-08-23T11:56:42.043028Z,2026-08-23T11:58:54.815505Z,132.77,17,3,0.172,0.545,20,0,61,0
+Human Dominant_9,R6,2026-08-23T11:58:58.885264Z,2026-08-23T12:01:29.951518Z,151.07,12,8,0.32,0.308,20,0,44,0

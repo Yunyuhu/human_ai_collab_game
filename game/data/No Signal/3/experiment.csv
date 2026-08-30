@@ -1,0 +1,2 @@
+user_id,exp_start_time,exp_end_time,total_score,total_errors,human_total_accuracy,agent_total_accuracy,total_signals,human_total_signals,agent_total_signals,total_conflict,total_rounds,notes
+No Signal_3,2026-08-11T02:40:44.480020Z,2026-08-11T03:46:32.165984Z,83,37,0.483,0.618,0,0,0,7,6,
