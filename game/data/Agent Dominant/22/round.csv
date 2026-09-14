@@ -1,0 +1,7 @@
+user_id,round_id,round_start_time,round_end_time,round_duration,round_score,round_errors,human_accuracy,agent_accuracy,enemy_spawn_count,conflict_count,human_signal_count,agent_signal_count
+Agent Dominant_22,R1,2026-09-02T01:02:45.966230Z,2026-09-02T01:05:19.917071Z,153.95,13,7,0.667,0.417,20,4,0,20
+Agent Dominant_22,R2,2026-09-02T01:05:25.596781Z,2026-09-02T01:07:53.549933Z,147.95,16,4,1.0,0.421,20,0,0,20
+Agent Dominant_22,R3,2026-09-02T01:09:21.942116Z,2026-09-02T01:11:39.665974Z,137.72,16,4,0.545,0.769,20,0,0,20
+Agent Dominant_22,R4,2026-09-02T01:11:47.825958Z,2026-09-02T01:13:54.380962Z,126.56,18,2,0.778,0.647,20,0,0,20
+Agent Dominant_22,R5,2026-09-02T01:14:56.018108Z,2026-09-02T01:17:02.630150Z,126.61,19,1,1.0,0.7,20,1,0,20
+Agent Dominant_22,R6,2026-09-02T01:17:08.287933Z,2026-09-02T01:19:17.647600Z,129.36,13,7,0.857,0.292,20,1,0,20

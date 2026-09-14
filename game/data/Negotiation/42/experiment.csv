@@ -1,0 +1,2 @@
+user_id,exp_start_time,exp_end_time,total_score,total_errors,human_total_accuracy,agent_total_accuracy,total_signals,human_total_signals,agent_total_signals,total_conflict,total_rounds,notes
+Negotiation_42,2026-09-09T04:52:31.364719Z,2026-09-09T05:18:11.221452Z,83,37,0.277,0.569,229,110,119,18,6,

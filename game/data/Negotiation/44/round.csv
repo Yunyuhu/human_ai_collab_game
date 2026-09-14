@@ -1,0 +1,5 @@
+user_id,round_id,round_start_time,round_end_time,round_duration,round_score,round_errors,human_accuracy,agent_accuracy,enemy_spawn_count,conflict_count,human_signal_count,agent_signal_count
+Negotiation_44,R1,2026-09-09T12:10:19.801443Z,2026-09-09T12:12:42.698469Z,142.9,15,5,0.571,0.647,20,3,20,22
+Negotiation_44,R2,2026-09-09T12:12:52.480642Z,2026-09-09T12:15:07.539630Z,135.06,14,6,0.5,0.355,20,0,16,20
+Negotiation_44,R3,2026-09-09T12:16:09.121658Z,2026-09-09T12:18:32.751907Z,143.63,16,4,0.667,0.438,20,2,25,21
+Negotiation_44,R4,2026-09-09T12:18:38.014628Z,2026-09-09T12:21:02.883973Z,144.87,13,7,0.6,0.526,20,4,21,27
